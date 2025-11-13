@@ -636,10 +636,10 @@ static struct config Config = { // cmdtab settings
 	// Appearance
 	.darkmode                = false,
 	.hideTaskbar             = true,
-	.switcherHeight          = 180,
+	.switcherHeight          = 260,
 	.switcherHorzMargin      =  32,
-	.switcherVertMargin      =  40,
-	.iconWidth               =  96,
+	.switcherVertMargin      =  52,
+	.iconWidth               = 156,
 	.iconHorzPadding         =  12,
 	// Blacklist
 	.blacklist = {
@@ -945,14 +945,38 @@ static void ResizeSwitcher(void)
 	MONITORINFO mi = { .cbSize = sizeof(MONITORINFO) };
 	GetMonitorInfoW(MonitorFromPoint(mousePos, MONITOR_DEFAULTTONEAREST), &mi);
 
-	u32   iconsWidth = AppsCount * Config.iconWidth;
-	u32 paddingWidth = AppsCount * Config.iconHorzPadding * 2;
-	u32  marginWidth =         2 * Config.switcherHorzMargin;
-
+	// Calculate available screen width
+	u32 screenWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+	
+	// Start with preferred icon size (156px)
+	u32 iconWidth = 156;
+	u32 iconPadding = Config.iconHorzPadding;
+	u32 marginWidth = 2 * Config.switcherHorzMargin;
+	
+	// Calculate required width with preferred icon size
+	u32 requiredWidth = (AppsCount * iconWidth) + (AppsCount * iconPadding * 2) + marginWidth;
+	
+	// If it doesn't fit, scale down the icon size proportionally
+	if (requiredWidth > screenWidth) {
+		u32 availableWidth = screenWidth - marginWidth - (AppsCount * iconPadding * 2);
+		iconWidth = availableWidth / AppsCount;
+		// Don't go below a minimum reasonable size
+		if (iconWidth < 48) {
+			iconWidth = 48;
+		}
+	}
+	
+	// Recalculate final dimensions with adjusted icon size
+	u32   iconsWidth = AppsCount * iconWidth;
+	u32 paddingWidth = AppsCount * iconPadding * 2;
+	
 	u32 w = iconsWidth + paddingWidth + marginWidth;
 	u32 h = Config.switcherHeight;
-	i32 x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - w) / 2;
+	i32 x = mi.rcMonitor.left + (screenWidth - w) / 2;
 	i32 y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top - h) / 2;
+	
+	// Update Config.iconWidth for RedrawSwitcher to use
+	Config.iconWidth = iconWidth;
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
 	
