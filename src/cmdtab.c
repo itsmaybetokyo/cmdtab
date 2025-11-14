@@ -636,7 +636,7 @@ static struct config Config = { // cmdtab settings
 	// Appearance
 	.darkmode                = false,
 	.hideTaskbar             = true,
-	.switcherHeight          = 260,
+	.switcherHeight          = 280,
 	.switcherHorzMargin      =  32,
 	.switcherVertMargin      =  52,
 	.iconWidth               = 156,
@@ -834,16 +834,11 @@ static void AddToSwitcher(handle hwnd)
 	app->window = hwnd;
 	app->icon = GetAppIcon(&filepath);
 	
-	// Get window title for more descriptive names
-	string windowTitle = GetWindowTitle(hwnd);
-	app->windowTitle = windowTitle;
+	// Always use app name (e.g., "Cursor" instead of "Cursor Settings - cmdtab - Cursor")
+	app->name = GetAppName(&filepath);
 	
-	// Use window title as name, fallback to app name if title is empty
-	if (windowTitle.ok && windowTitle.length > 0) {
-		app->name = windowTitle;
-	} else {
-		app->name = GetAppName(&filepath);
-	}
+	// Store window title for potential future use
+	app->windowTitle = GetWindowTitle(hwnd);
 	
 	Print(L"add window %s", GetAppHost(hwnd) != hwnd ? L"(uwp) " : L"");
 	PrintWindowX(hwnd);
@@ -1004,10 +999,10 @@ static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
 
-	#define BACKGROUND   RGB(32, 32, 32) // dark mode?
-	#define TEXT_COLOR   RGB(235, 235, 235)
+	#define BACKGROUND   RGB(20, 20, 20) // Dark translucent background for blur effect
+	#define TEXT_COLOR   RGB(255, 255, 255)
 	#define HIGHLIGHT    RGB(76, 194, 255) // Sampled from Windows 11 Alt-Tab
-	#define HIGHLIGHT_BG RGB(11, 11, 11) // Sampled from Windows 11 Alt-Tab
+	#define HIGHLIGHT_BG RGB(40, 40, 40) // Slightly lighter for selection
 
 	// Use Config values instead of hardcoded constants
 	u32 ICON_WIDTH = Config.iconWidth;
@@ -1037,7 +1032,7 @@ static void RedrawSwitcher(void)
 	DeleteObject(roundedRegion);
 	
 	// Draw rounded border/outline to match the background
-	HPEN borderPen = CreatePen(PS_SOLID, 2, RGB(60, 60, 60)); // Subtle border
+	HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80)); // Very subtle border for blur effect
 	HPEN oldBorderPen = (HPEN)SelectObject(DrawingContext, borderPen);
 	HBRUSH oldBorderBrush = (HBRUSH)SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
 	RoundRect(DrawingContext, 1, 1, rect.right-1, rect.bottom-1, 30, 30);
@@ -1664,12 +1659,20 @@ static int RunCmdTab(handle instance, u16 *args)
 	wcex.hInstance = instance;
 	wcex.hCursor = LoadCursor(instance, IDC_ARROW);
 	wcex.lpszClassName = L"cmdtabSwitcher";
-	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
+	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
 	// Clear all window styles for very plain window
 	SetWindowLongW(Switcher, GWL_STYLE, 0);
+	// Enable layered window with transparency
+	SetLayeredWindowAttributes(Switcher, 0, 245, LWA_ALPHA);
 	// Disable DWM window corners since we're drawing our own
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
+	// Enable blur behind effect
+	DWM_BLURBEHIND bb = {0};
+	bb.dwFlags = DWM_BB_ENABLE;
+	bb.fEnable = TRUE;
+	bb.hRgnBlur = NULL;
+	DwmEnableBlurBehindWindow(Switcher, &bb);
 
 	// Install keyboard hook and event hooks for foreground window changes. Raymond Chen: https://devblogs.microsoft.com/oldnewthing/20130930-00/?p=3083
 	keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, (HOOKPROC)KeyboardHookProcedure, null, 0);
