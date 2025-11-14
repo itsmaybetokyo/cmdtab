@@ -1020,10 +1020,13 @@ static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
 
-	#define BACKGROUND   RGB(12, 12, 12) // Dark, solid background to better match dock-style look
+	// Visual style inspired by macOS dock:
+	// - BACKGROUND: dark and nearly opaque so underlying content is barely perceptible
+	// - HIGHLIGHT_BG: even darker block to clearly indicate the selected app
+	#define BACKGROUND   RGB(10, 10, 10)
 	#define TEXT_COLOR   RGB(235, 235, 235)
 	#define HIGHLIGHT    RGB(76, 194, 255) // Accent color (not currently used for borders)
-	#define HIGHLIGHT_BG RGB(5, 5, 5)     // Selection background, slightly darker than BACKGROUND
+	#define HIGHLIGHT_BG RGB(0, 0, 0)      // Selection background, clearly darker than BACKGROUND
 
 	// Use Config values instead of hardcoded constants
 	u32 ICON_WIDTH = Config.iconWidth;
