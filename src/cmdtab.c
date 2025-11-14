@@ -996,8 +996,8 @@ static void ResizeSwitcher(void)
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
 	
-	// Apply rounded corners to the window itself (more rounded, dock-style)
-	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 40, 40);
+	// Apply rounded corners to the window itself (even more rounded, dock-style)
+	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 60, 60);
 	SetWindowRgn(Switcher, windowRegion, TRUE);
 	// Note: SetWindowRgn takes ownership of the region, so don't delete it
 
@@ -1049,7 +1049,7 @@ static void RedrawSwitcher(void)
 	RedrawWindow(Switcher, null, null, RDW_INVALIDATE | RDW_ERASE);
 	
 	// Create rounded rectangle for window background (strongly rounded corners)
-	HRGN roundedRegion = CreateRoundRectRgn(0, 0, rect.right, rect.bottom, 40, 40);
+	HRGN roundedRegion = CreateRoundRectRgn(0, 0, rect.right, rect.bottom, 60, 60);
 	FillRgn(DrawingContext, roundedRegion, windowBackground);
 	DeleteObject(roundedRegion);
 
@@ -1685,11 +1685,13 @@ static int RunCmdTab(handle instance, u16 *args)
 	wcex.hInstance = instance;
 	wcex.hCursor = LoadCursor(instance, IDC_ARROW);
 	wcex.lpszClassName = L"cmdtabSwitcher";
-	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
+	// Toolwindow + topmost; no WS_EX_LAYERED so the surface itself is fully opaque,
+	// and only the DWM blur effect provides the \"glass\" feel.
+	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+	                           MAKEINTATOM(RegisterClassExW(&wcex)),
+	                           null, 0, 0, 0, 0, 0, null, null, instance, null);
 	// Clear all window styles for very plain window
 	SetWindowLongW(Switcher, GWL_STYLE, 0);
-	// Enable layered window with (almost) opaque alpha so blur feels solid
-	SetLayeredWindowAttributes(Switcher, 0, 255, LWA_ALPHA);
 	// Disable DWM window corners since we're drawing our own
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
