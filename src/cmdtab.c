@@ -1698,7 +1698,10 @@ static int RunCmdTab(handle instance, u16 *args)
 	// Disable DWM window corners since we're drawing our own
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
-	// Explicitly disable any DWM blur so the background is 100% opaque.
+
+	// Explicitly disable blur-behind to avoid any DWM-driven translucency.
+	// This keeps the dock background fully opaque; if we ever want blur again,
+	// we'll need to reintroduce it knowing it always implies some transparency.
 	DWM_BLURBEHIND bb = {0};
 	bb.dwFlags = DWM_BB_ENABLE;
 	bb.fEnable = FALSE;
