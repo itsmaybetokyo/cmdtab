@@ -943,8 +943,13 @@ static void ResizeSwitcher(void)
 	// Calculate available screen width
 	u32 screenWidth = mi.rcMonitor.right - mi.rcMonitor.left;
 	
+	// Base metrics for layout (these correspond to the \"ideal\" setup)
+	const u32 baseIconWidth       = 156;
+	const u32 baseSwitcherHeight  = 280;
+	const u32 baseVertMargin      = 52;
+	
 	// Start with preferred icon size (156px)
-	u32 iconWidth = 156;
+	u32 iconWidth   = baseIconWidth;
 	u32 iconPadding = Config.iconHorzPadding;
 	u32 marginWidth = 2 * Config.switcherHorzMargin;
 	
@@ -952,7 +957,7 @@ static void ResizeSwitcher(void)
 	u32 requiredWidth = (AppsCount * iconWidth) + (AppsCount * iconPadding * 2) + marginWidth;
 	
 	// If it doesn't fit, scale down the icon size proportionally
-	if (requiredWidth > screenWidth) {
+	if (requiredWidth > screenWidth && AppsCount > 0) {
 		u32 availableWidth = screenWidth - marginWidth - (AppsCount * iconPadding * 2);
 		iconWidth = availableWidth / AppsCount;
 		// Don't go below a minimum reasonable size
@@ -961,17 +966,33 @@ static void ResizeSwitcher(void)
 		}
 	}
 	
+	// Scale background height and vertical padding along with icon size
+	float scale = (float)iconWidth / (float)baseIconWidth;
+	if (scale > 1.0f) {
+		scale = 1.0f; // never grow beyond the base metrics
+	}
+	u32 switcherHeight = (u32)(baseSwitcherHeight * scale);
+	u32 vertMargin     = (u32)(baseVertMargin * scale);
+	if (switcherHeight < 160) {
+		switcherHeight = 160; // keep a sensible minimum height
+	}
+	if (vertMargin < 24) {
+		vertMargin = 24;
+	}
+	
 	// Recalculate final dimensions with adjusted icon size
 	u32   iconsWidth = AppsCount * iconWidth;
 	u32 paddingWidth = AppsCount * iconPadding * 2;
 	
 	u32 w = iconsWidth + paddingWidth + marginWidth;
-	u32 h = Config.switcherHeight;
+	u32 h = switcherHeight;
 	i32 x = mi.rcMonitor.left + (screenWidth - w) / 2;
 	i32 y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top - h) / 2;
 	
-	// Update Config.iconWidth for RedrawSwitcher to use
-	Config.iconWidth = iconWidth;
+	// Update Config so RedrawSwitcher uses the scaled metrics
+	Config.iconWidth          = iconWidth;
+	Config.switcherHeight     = switcherHeight;
+	Config.switcherVertMargin = vertMargin;
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
 	
@@ -999,8 +1020,8 @@ static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
 
-	#define BACKGROUND   RGB(20, 20, 20) // Dark translucent background for blur effect
-	#define TEXT_COLOR   RGB(255, 255, 255)
+	#define BACKGROUND   RGB(12, 12, 12) // Dark, solid background to better match dock-style look
+	#define TEXT_COLOR   RGB(235, 235, 235)
 	#define HIGHLIGHT    RGB(76, 194, 255) // Sampled from Windows 11 Alt-Tab
 	#define HIGHLIGHT_BG RGB(40, 40, 40) // Slightly lighter for selection
 
@@ -1662,8 +1683,8 @@ static int RunCmdTab(handle instance, u16 *args)
 	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
 	// Clear all window styles for very plain window
 	SetWindowLongW(Switcher, GWL_STYLE, 0);
-	// Enable layered window with transparency
-	SetLayeredWindowAttributes(Switcher, 0, 245, LWA_ALPHA);
+	// Enable layered window with (almost) opaque alpha so blur feels solid
+	SetLayeredWindowAttributes(Switcher, 0, 255, LWA_ALPHA);
 	// Disable DWM window corners since we're drawing our own
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
