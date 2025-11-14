@@ -996,8 +996,8 @@ static void ResizeSwitcher(void)
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
 	
-	// Apply rounded corners to the window itself
-	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 30, 30);
+	// Apply rounded corners to the window itself (more rounded, dock-style)
+	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 40, 40);
 	SetWindowRgn(Switcher, windowRegion, TRUE);
 	// Note: SetWindowRgn takes ownership of the region, so don't delete it
 
@@ -1022,8 +1022,8 @@ static void RedrawSwitcher(void)
 
 	#define BACKGROUND   RGB(12, 12, 12) // Dark, solid background to better match dock-style look
 	#define TEXT_COLOR   RGB(235, 235, 235)
-	#define HIGHLIGHT    RGB(76, 194, 255) // Sampled from Windows 11 Alt-Tab
-	#define HIGHLIGHT_BG RGB(40, 40, 40) // Slightly lighter for selection
+	#define HIGHLIGHT    RGB(76, 194, 255) // Accent color (not currently used for borders)
+	#define HIGHLIGHT_BG RGB(5, 5, 5)     // Selection background, slightly darker than BACKGROUND
 
 	// Use Config values instead of hardcoded constants
 	u32 ICON_WIDTH = Config.iconWidth;
@@ -1037,9 +1037,10 @@ static void RedrawSwitcher(void)
 	#define SEL_HORZ_OFF 12 // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
 
 	// Create brushes and pens fresh each time to avoid release mode optimization issues
-	HBRUSH windowBackground = CreateSolidBrush(BACKGROUND);
+	HBRUSH windowBackground    = CreateSolidBrush(BACKGROUND);
 	HBRUSH selectionBackground = CreateSolidBrush(HIGHLIGHT_BG);
-	HPEN selectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, (GetAccentColor() & 0x00FFFFFF));
+	// Use a pen the same color as the fill so the selection has no visible outline
+	HPEN   selectionOutline    = CreatePen(PS_SOLID, 1, HIGHLIGHT_BG);
 
 	RECT rect = {0};
 	GetClientRect(Switcher, &rect);
@@ -1047,26 +1048,30 @@ static void RedrawSwitcher(void)
 	// Invalidate & draw window background with rounded corners
 	RedrawWindow(Switcher, null, null, RDW_INVALIDATE | RDW_ERASE);
 	
-	// Create rounded rectangle for window background
-	HRGN roundedRegion = CreateRoundRectRgn(0, 0, rect.right, rect.bottom, 30, 30);
+	// Create rounded rectangle for window background (strongly rounded corners)
+	HRGN roundedRegion = CreateRoundRectRgn(0, 0, rect.right, rect.bottom, 40, 40);
 	FillRgn(DrawingContext, roundedRegion, windowBackground);
 	DeleteObject(roundedRegion);
-	
-	// Draw rounded border/outline to match the background
-	HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80)); // Very subtle border for blur effect
-	HPEN oldBorderPen = (HPEN)SelectObject(DrawingContext, borderPen);
-	HBRUSH oldBorderBrush = (HBRUSH)SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
-	RoundRect(DrawingContext, 1, 1, rect.right-1, rect.bottom-1, 30, 30);
-	SelectObject(DrawingContext, oldBorderPen);
-	SelectObject(DrawingContext, oldBorderBrush);
-	DeleteObject(borderPen);
 
 	// Select pen & brush for RoundRect (used to draw selection rectangle)
-	HPEN oldPen = (HPEN)SelectObject(DrawingContext, selectionOutline);
+	HPEN oldPen   = (HPEN)SelectObject(DrawingContext, selectionOutline);
 	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, selectionBackground);
 
 	// Select text font, color & background for DrawTextW (used to draw app name)
-	HFONT oldFont = (HFONT)SelectObject(DrawingContext, GetStockObject(DEFAULT_GUI_FONT));
+	HFONT oldFont = (HFONT)SelectObject(
+		DrawingContext,
+		CreateFontW(
+			-18, 0, 0, 0,
+			FW_MEDIUM,
+			false, false, false,
+			DEFAULT_CHARSET,
+			OUT_DEFAULT_PRECIS,
+			CLIP_DEFAULT_PRECIS,
+			CLEARTYPE_QUALITY,
+			VARIABLE_PITCH,
+			L"Segoe UI"
+		)
+	);
 	SetTextColor(DrawingContext, TEXT_COLOR);
 	SetBkMode(DrawingContext, TRANSPARENT);
 
