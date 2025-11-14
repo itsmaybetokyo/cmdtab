@@ -1065,7 +1065,7 @@ static void RedrawSwitcher(void)
 		DrawingContext,
 		CreateFontW(
 			-18, 0, 0, 0,
-			FW_MEDIUM,
+			FW_BOLD,          // Make app labels bold
 			false, false, false,
 			DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS,
