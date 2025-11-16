@@ -41,12 +41,17 @@
 #include "strsafe.h"
 #include <initguid.h>
 #include "commoncontrols.h"
+#include "appmodel.h" // For GetApplicationUserModelId
+#include "propkey.h" // For PKEY_AppUserModel_ID
+#include "propsys.h" // For IPropertyStore
+#include "shobjidl.h" // For IShellItem, IShellItemImageFactory
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shlwapi.lib") // Only used by StringFileName for PathFindFileNameW?
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "pathcch.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "propsys.lib") // For UWP property access
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -80,6 +85,7 @@ struct string {
 static const string UWPAppHostExe      = string(L"ApplicationFrameHost.exe");
 static const string UWPAppHostClass    = string(L"ApplicationFrameWindow");
 static const string UWPCoreWindowClass = string(L"Windows.UI.Core.CoreWindow");
+static const string WinUI3WindowClass  = string(L"WinUIDesktopWin32WindowClass");
 static const string UWPAppsPath        = string(L"C:\\Program Files\\WindowsApps");
 
 static bool StringsAreEqual(string *s1, string *s2)
@@ -229,6 +235,247 @@ static handle GetAppHost(handle hwnd)
 	} else {
 		return hwnd;
 	}
+}
+
+static bool IsUWPApp(handle hwnd)
+{
+	// Check if this is a modern packaged app (UWP or WinUI 3)
+	string class = GetWindowClass(hwnd);
+	// UWP apps use Windows.UI.Core.CoreWindow, WinUI 3 apps use WinUIDesktopWin32WindowClass
+	return StringsAreEqual(&class, &UWPCoreWindowClass) || StringsAreEqual(&class, &WinUI3WindowClass);
+}
+
+static string GetUWPAppUserModelId(handle mainHwnd, handle secondaryHwnd)
+{
+	// Get the Application User Model ID for a modern packaged app (UWP/WinUI 3) using IPropertyStore
+	// For UWP: mainHwnd is ApplicationFrameWindow, secondaryHwnd is CoreWindow
+	// For WinUI 3: mainHwnd is the app window directly, secondaryHwnd is the same
+	string aumid = {0};
+
+	// Try the main window first
+	IPropertyStore *propStore = NULL;
+	HRESULT hr = SHGetPropertyStoreForWindow(mainHwnd, &IID_IPropertyStore, (void**)&propStore);
+	Print(L"SHGetPropertyStoreForWindow (main) result: 0x%08X\n", hr);
+	if (SUCCEEDED(hr)) {
+		PROPVARIANT propVar;
+		PropVariantInit(&propVar);
+
+		hr = IPropertyStore_GetValue(propStore, &PKEY_AppUserModel_ID, &propVar);
+		Print(L"IPropertyStore_GetValue result: 0x%08X\n", hr);
+		if (SUCCEEDED(hr)) {
+			if (propVar.vt == VT_LPWSTR && propVar.pwszVal) {
+				StringCchCopyW(aumid.text, countof(aumid.text), propVar.pwszVal);
+				aumid.length = wcslen(aumid.text);
+				aumid.ok = (aumid.length > 0);
+				Print(L"Got AUMID from main window: %s\n", aumid.text);
+			}
+			PropVariantClear(&propVar);
+		}
+		IPropertyStore_Release(propStore);
+
+		if (aumid.ok) return aumid;
+	}
+
+	// If that failed and we have a different secondary window (UWP case), try it
+	if (secondaryHwnd != mainHwnd) {
+		hr = SHGetPropertyStoreForWindow(secondaryHwnd, &IID_IPropertyStore, (void**)&propStore);
+		Print(L"SHGetPropertyStoreForWindow (secondary) result: 0x%08X\n", hr);
+		if (SUCCEEDED(hr)) {
+			PROPVARIANT propVar;
+			PropVariantInit(&propVar);
+
+			if (SUCCEEDED(IPropertyStore_GetValue(propStore, &PKEY_AppUserModel_ID, &propVar))) {
+				if (propVar.vt == VT_LPWSTR && propVar.pwszVal) {
+					StringCchCopyW(aumid.text, countof(aumid.text), propVar.pwszVal);
+					aumid.length = wcslen(aumid.text);
+					aumid.ok = (aumid.length > 0);
+					Print(L"Got AUMID from secondary window: %s\n", aumid.text);
+				}
+				PropVariantClear(&propVar);
+			}
+			IPropertyStore_Release(propStore);
+
+			if (aumid.ok) return aumid;
+		}
+	}
+
+	// If property store failed, try GetApplicationUserModelId from the process (WinUI 3 apps)
+	Print(L"Property store methods failed, trying GetApplicationUserModelId from process\n");
+	
+	u32 processId = 0;
+	GetWindowThreadProcessId(mainHwnd, &processId);
+	
+	if (processId) {
+		Print(L"Process ID: %u\n", processId);
+		handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+		if (process) {
+			u32 aumidLength = countof(aumid.text);
+			LONG result = GetApplicationUserModelId(process, &aumidLength, aumid.text);
+			Print(L"GetApplicationUserModelId result: %d, length: %u\n", result, aumidLength);
+			
+			if (result == ERROR_SUCCESS) {
+				aumid.length = wcslen(aumid.text);
+				aumid.ok = (aumid.length > 0);
+				Print(L"Got AUMID from process: %s\n", aumid.text);
+			} else if (result == ERROR_INSUFFICIENT_BUFFER) {
+				Print(L"AUMID buffer too small (needed %u chars)\n", aumidLength);
+			} else {
+				Print(L"GetApplicationUserModelId failed with error: %d\n", result);
+			}
+			
+			CloseHandle(process);
+		} else {
+			Print(L"Failed to open process, error: %d\n", GetLastError());
+		}
+	}
+
+	if (!aumid.ok) {
+		Print(L"Failed to get AUMID from all methods\n");
+	}
+
+	return aumid;
+}
+
+static string GetUWPAppName(string *aumid)
+{
+	// Extract a friendly name from the AUMID
+	// AUMID format examples:
+	//   UWP: CompanyName.AppName_hash_variant_suffix!App
+	//   WinUI3: CompanyName.AppName_hash_variant_suffix!AppName.Root
+	// We want to extract "AppName" part
+	string name = {0};
+	
+	if (!aumid->ok || aumid->length == 0) {
+		return name;
+	}
+	
+	// Copy the AUMID
+	StringCchCopyW(name.text, countof(name.text), aumid->text);
+	
+	// First, check if there's an exclamation mark (separates package from app ID)
+	u16 *exclamation = wcschr(name.text, L'!');
+	if (exclamation) {
+		// If there's something after !, try to use that
+		u16 *appPart = exclamation + 1;
+		if (wcslen(appPart) > 0) {
+			// Check if it's like "AppName.Root" - remove the .Root part
+			u16 *dotInAppPart = wcschr(appPart, L'.');
+			if (dotInAppPart) {
+				*dotInAppPart = L'\0';
+			}
+			// Use the app part if it's not just "App"
+			if (wcscmp(appPart, L"App") != 0 && wcslen(appPart) > 0) {
+				memmove(name.text, appPart, (wcslen(appPart) + 1) * sizeof(u16));
+				name.length = wcslen(name.text);
+				name.ok = true;
+				return name;
+			}
+		}
+		// If the app part is just "App", truncate at ! and continue with package name logic
+		*exclamation = L'\0';
+	}
+	
+	// Find the first dot (separates company from app name)
+	u16 *dot = wcschr(name.text, L'.');
+	if (!dot) {
+		// No dot found, just use what we have
+		name.length = wcslen(name.text);
+		name.ok = (name.length > 0);
+		return name;
+	}
+	
+	// Find the first underscore after the dot (separates app name from hash)
+	u16 *underscore = wcschr(dot + 1, L'_');
+	if (underscore) {
+		*underscore = L'\0'; // Truncate at underscore
+	}
+	
+	// Move the string to remove the company prefix
+	memmove(name.text, dot + 1, (wcslen(dot + 1) + 1) * sizeof(u16));
+	name.length = wcslen(name.text);
+	name.ok = (name.length > 0);
+	
+	return name;
+}
+
+static handle GetUWPAppIcon(string *aumid, handle hwnd)
+{
+	// Try multiple methods to get the UWP app icon
+	if (!aumid->ok || aumid->length == 0) {
+		return null;
+	}
+	
+	HICON icon = null;
+	
+	// Method 1: Try using IShellItemImageFactory (most reliable for UWP apps)
+	u16 shellPath[MAX_PATH * 2];
+	StringCchPrintfW(shellPath, countof(shellPath), L"shell:AppsFolder\\%s", aumid->text);
+	
+	IShellItem *shellItem = null;
+	if (SUCCEEDED(SHCreateItemFromParsingName(shellPath, null, &IID_IShellItem, (void**)&shellItem))) {
+		IShellItemImageFactory *imageFactory = null;
+		if (SUCCEEDED(IShellItem_QueryInterface(shellItem, &IID_IShellItemImageFactory, (void**)&imageFactory))) {
+			SIZE size = { 48, 48 }; // Request 48x48 icon
+			HBITMAP hbmp = null;
+			if (SUCCEEDED(IShellItemImageFactory_GetImage(imageFactory, size, SIIGBF_ICONONLY, &hbmp))) {
+				// Convert HBITMAP to HICON
+				ICONINFO iconInfo = {0};
+				iconInfo.fIcon = TRUE;
+				iconInfo.hbmColor = hbmp;
+				iconInfo.hbmMask = hbmp;
+				icon = CreateIconIndirect(&iconInfo);
+				DeleteObject(hbmp);
+				if (icon) {
+					Print(L"Got UWP icon via IShellItemImageFactory\n");
+					IShellItemImageFactory_Release(imageFactory);
+					IShellItem_Release(shellItem);
+					return icon;
+				}
+			}
+			IShellItemImageFactory_Release(imageFactory);
+		}
+		IShellItem_Release(shellItem);
+	}
+	
+	// Method 2: Try using shell:AppsFolder with ExtractIconEx
+	HICON largeIcon = null, smallIcon = null;
+	if (ExtractIconExW(shellPath, 0, &largeIcon, &smallIcon, 1) > 0) {
+		if (smallIcon) DestroyIcon(smallIcon);
+		if (largeIcon) {
+			Print(L"Got UWP icon via ExtractIconEx\n");
+			return largeIcon;
+		}
+	}
+	
+	// Method 3: Try getting icon from window property
+	icon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
+	if (!icon) {
+		icon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
+	}
+	if (!icon) {
+		icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
+	}
+	if (icon) {
+		// Copy the icon so we can safely destroy it later
+		icon = CopyIcon(icon);
+		Print(L"Got UWP icon from window messages\n");
+		return icon;
+	}
+	
+	// Method 4: Use SHGetFileInfo with shell path
+	IImageList *list = {0};
+	if (SUCCEEDED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) {
+		SHFILEINFOW info = {0};
+		if (SHGetFileInfoW(shellPath, 0, &info, sizeof info, SHGFI_SYSICONINDEX)) {
+			IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &icon);
+			if (icon) {
+				Print(L"Got UWP icon via SHGetFileInfo\n");
+			}
+		}
+		IImageList_Release(list);
+	}
+	
+	return icon;
 }
 
 static bool IsAltTabWindow(handle hwnd)
@@ -797,6 +1044,7 @@ static void AddToHistory(handle hwnd) {
 static void AddToSwitcher(handle hwnd)
 {
 	// 1. Get hosted window in case of UWP host
+	handle originalHwnd = hwnd;
 	hwnd = GetCoreWindow(hwnd);
 	// 2. Basic checks for eligibility in Alt-Tab
 	if (!IsAltTabWindow(hwnd)) {
@@ -832,15 +1080,91 @@ static void AddToSwitcher(handle hwnd)
 	// Set basic app info
 	app->path = filepath;
 	app->window = hwnd;
-	app->icon = GetAppIcon(&filepath);
 	
-	// Always use app name (e.g., "Cursor" instead of "Cursor Settings - cmdtab - Cursor")
-	app->name = GetAppName(&filepath);
+	// Check if this is a UWP app and handle it specially
+	bool isUWP = IsUWPApp(hwnd);
+	if (isUWP) {
+		Print(L"Detected UWP app, attempting to get AUMID...\n");
+		
+		// For UWP apps, get the Application User Model ID
+		// originalHwnd is the ApplicationFrameWindow (if coming from EnumWindows)
+		// hwnd is the CoreWindow (after GetCoreWindow)
+		string aumid = GetUWPAppUserModelId(originalHwnd, hwnd);
+		
+		if (aumid.ok) {
+			Print(L"Got AUMID: %s\n", aumid.text);
+			
+			// Try to get UWP-specific icon and name
+			app->icon = GetUWPAppIcon(&aumid, originalHwnd);
+			app->name = GetUWPAppName(&aumid);
+			
+			if (app->icon) {
+				Print(L"Successfully got UWP icon\n");
+			}
+			if (app->name.ok) {
+				Print(L"Successfully got UWP name: %s\n", app->name.text);
+			}
+		} else {
+			Print(L"Failed to get AUMID, trying fallbacks\n");
+		}
+		
+		// Fallback: Try to get icon from the window itself
+		if (!app->icon) {
+			Print(L"Trying to get icon from window messages...\n");
+			HICON icon = (HICON)SendMessageW(originalHwnd, WM_GETICON, ICON_BIG, 0);
+			if (!icon) icon = (HICON)SendMessageW(originalHwnd, WM_GETICON, ICON_SMALL2, 0);
+			if (!icon) icon = (HICON)GetClassLongPtrW(originalHwnd, GCLP_HICON);
+			if (icon) {
+				app->icon = CopyIcon(icon);
+				Print(L"Got icon from window\n");
+			}
+		}
+		
+		// Final fallback: use default icon
+		if (!app->icon) {
+			Print(L"Using fallback icon from filepath\n");
+			app->icon = GetAppIcon(&filepath);
+		}
+		
+		// Fallback for name: try window title
+		if (!app->name.ok) {
+			Print(L"Trying to get name from window title...\n");
+			app->name = GetWindowTitle(originalHwnd);
+			if (app->name.ok) {
+				Print(L"Got name from window title: %s\n", app->name.text);
+			}
+		}
+		
+		// If still no name, try the CoreWindow title
+		if (!app->name.ok && hwnd != originalHwnd) {
+			Print(L"Trying to get name from core window title...\n");
+			app->name = GetWindowTitle(hwnd);
+			if (app->name.ok) {
+				Print(L"Got name from core window: %s\n", app->name.text);
+			}
+		}
+		
+		// Last resort: use AUMID as name
+		if (!app->name.ok && aumid.ok) {
+			Print(L"Using AUMID as name\n");
+			app->name = aumid;
+		}
+		
+		// Absolute last resort: use filename
+		if (!app->name.ok) {
+			Print(L"Using filename as name\n");
+			app->name = StringFileName(&filepath, false);
+		}
+	} else {
+		// Regular Win32 app - use existing logic
+		app->icon = GetAppIcon(&filepath);
+		app->name = GetAppName(&filepath);
+	}
 	
 	// Store window title for potential future use
 	app->windowTitle = GetWindowTitle(hwnd);
 	
-	Print(L"add window %s", GetAppHost(hwnd) != hwnd ? L"(uwp) " : L"");
+	Print(L"add window %s", isUWP ? L"(uwp) " : L"");
 	PrintWindowX(hwnd);
 }
 
