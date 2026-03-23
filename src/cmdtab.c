@@ -1,4 +1,4 @@
-﻿#include <math.h>
+#include <math.h>
 
 #define UNICODE
 #define _UNICODE
@@ -491,8 +491,25 @@ static bool IsAltTabWindow(handle hwnd)
 	if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW) {
 		return true;
 	}
-	if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_NOACTIVATE ||
-		GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
+	// Reject windows with WS_EX_NOACTIVATE (can't be activated)
+	if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_NOACTIVATE) {
+		return false;
+	}
+	// Reject tool windows, EXCEPT if they have a valid title (some Qt apps use WS_EX_TOOLWINDOW for main windows)
+	if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
+		// Check if window has a non-empty title - if so, it's likely a real application window
+		u16 title[256] = {0};
+		int titleLength = GetWindowTextW(hwnd, title, countof(title));
+		if (titleLength > 0) {
+			// Has a title, allow it (for Qt apps and similar)
+			return true;
+		}
+		// No title, it's likely a system tray icon or other tool window
+		return false;
+	}
+	// Skip untitled windows (prevents Explorer/shell host ghost entries)
+	// while still allowing explicit app windows handled above.
+	if (GetWindowTextLengthW(hwnd) == 0) {
 		return false;
 	}
 	return true;
@@ -884,8 +901,8 @@ static struct config Config = { // cmdtab settings
 	.darkmode                = false,
 	.hideTaskbar             = true,
 	.switcherHeight          = 280,
-	.switcherHorzMargin      =  32,
-	.switcherVertMargin      =  52,
+	.switcherHorzMargin      =  48,
+	.switcherVertMargin      =  48,
 	.iconWidth               = 156,
 	.iconHorzPadding         =  12,
 	// Blacklist
@@ -893,6 +910,9 @@ static struct config Config = { // cmdtab settings
 		{ null,                       L"ApplicationFrameWindow" },
 		{ L"SearchHost",              L"Windows.UI.Core.CoreWindow" },
 		{ L"StartMenuExperienceHost", L"Windows.UI.Core.CoreWindow" },
+		{ L"Wispr Flow Helper",       null },
+		{ L"Wispr Flow",              null },	
+		{ L"Raycast",          null },
 	},
 };
 
@@ -1266,49 +1286,41 @@ static void ResizeSwitcher(void)
 
 	// Calculate available screen width
 	u32 screenWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+	u32 screenHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
 	
-	// Base metrics for layout (these correspond to the \"ideal\" setup)
-	const u32 baseIconWidth       = 156;
-	const u32 baseSwitcherHeight  = 280;
-	const u32 baseVertMargin      = 52;
+	// Base metrics
+	const u32 maxIconWidth = 132;
+	const u32 minIconWidth = 48;
+	const u32 basePadding  = 26;
+	const u32 sideGutter = 34;      // Always keep side breathing room (Apple-like)
 	
-	// Start with preferred icon size (156px)
-	u32 iconWidth   = baseIconWidth;
-	u32 iconPadding = Config.iconHorzPadding;
-	u32 marginWidth = 2 * Config.switcherHorzMargin;
-	
-	// Calculate required width with preferred icon size
+	u32 iconWidth   = maxIconWidth;
+	u32 iconPadding = 12;
+	u32 padding = basePadding;
+
+	u32 w = 0;
+	u32 usableWidth = screenWidth > sideGutter * 2 ? screenWidth - sideGutter * 2 : screenWidth;
+	u32 marginWidth = 2 * padding;
 	u32 requiredWidth = (AppsCount * iconWidth) + (AppsCount * iconPadding * 2) + marginWidth;
-	
-	// If it doesn't fit, scale down the icon size proportionally
-	if (requiredWidth > screenWidth && AppsCount > 0) {
-		u32 availableWidth = screenWidth - marginWidth - (AppsCount * iconPadding * 2);
-		iconWidth = availableWidth / AppsCount;
-		// Don't go below a minimum reasonable size
-		if (iconWidth < 48) {
-			iconWidth = 48;
+
+	// Keep natural size whenever possible; only shrink when it doesn't fit.
+	if (requiredWidth <= usableWidth) {
+		w = requiredWidth;
+	} else {
+		w = usableWidth;
+		u32 availableWidth = w - marginWidth - (AppsCount * iconPadding * 2);
+		if (AppsCount > 0) {
+			iconWidth = max(minIconWidth, availableWidth / AppsCount);
 		}
 	}
-	
-	// Scale background height and vertical padding along with icon size
-	float scale = (float)iconWidth / (float)baseIconWidth;
-	if (scale > 1.0f) {
-		scale = 1.0f; // never grow beyond the base metrics
+
+	// Height with icons only (no labels)
+	u32 switcherHeight = (u32)(padding + iconWidth + padding);
+	u32 maxHeight = min((u32)300, (u32)(screenHeight * 0.90f));
+	if (switcherHeight > maxHeight) {
+		switcherHeight = maxHeight;
 	}
-	u32 switcherHeight = (u32)(baseSwitcherHeight * scale);
-	u32 vertMargin     = (u32)(baseVertMargin * scale);
-	if (switcherHeight < 160) {
-		switcherHeight = 160; // keep a sensible minimum height
-	}
-	if (vertMargin < 24) {
-		vertMargin = 24;
-	}
-	
-	// Recalculate final dimensions with adjusted icon size
-	u32   iconsWidth = AppsCount * iconWidth;
-	u32 paddingWidth = AppsCount * iconPadding * 2;
-	
-	u32 w = iconsWidth + paddingWidth + marginWidth;
+
 	u32 h = switcherHeight;
 	i32 x = mi.rcMonitor.left + (screenWidth - w) / 2;
 	i32 y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top - h) / 2;
@@ -1316,12 +1328,13 @@ static void ResizeSwitcher(void)
 	// Update Config so RedrawSwitcher uses the scaled metrics
 	Config.iconWidth          = iconWidth;
 	Config.switcherHeight     = switcherHeight;
-	Config.switcherVertMargin = vertMargin;
+	Config.switcherHorzMargin = padding;
+	Config.switcherVertMargin = padding;
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
 	
-	// Apply rounded corners to the window itself (even more rounded, dock-style)
-	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 60, 60);
+	// Apply more rounded corners to the window itself
+	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 56, 56);
 	SetWindowRgn(Switcher, windowRegion, TRUE);
 	// Note: SetWindowRgn takes ownership of the region, so don't delete it
 
@@ -1343,14 +1356,9 @@ static void ResizeSwitcher(void)
 static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
-
-	// Visual style inspired by macOS dock:
-	// - BACKGROUND: dark and nearly opaque so underlying content is barely perceptible
-	// - HIGHLIGHT_BG: even darker block to clearly indicate the selected app
-	#define BACKGROUND   RGB(10, 10, 10)
-	#define TEXT_COLOR   RGB(235, 235, 235)
-	#define HIGHLIGHT    RGB(76, 194, 255) // Accent color (not currently used for borders)
-	#define HIGHLIGHT_BG RGB(0, 0, 0)      // Selection background, clearly darker than BACKGROUND
+	// Visual style: single rounded panel with icon-only items.
+	#define PANEL_BG       RGB(35, 42, 56)
+	#define SELECTED_BG    RGB(24, 30, 42)
 
 	// Use Config values instead of hardcoded constants
 	u32 ICON_WIDTH = Config.iconWidth;
@@ -1358,16 +1366,13 @@ static void RedrawSwitcher(void)
 	u32 HORZ_PAD   = Config.switcherHorzMargin;
 	u32 VERT_PAD   = Config.switcherVertMargin;
 
-	#define SEL_OUTLINE   4
-	#define SEL_RADIUS   25
-	#define SEL_VERT_OFF 18 // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
-	#define SEL_HORZ_OFF 12 // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
+	u32 iconInset = max(4, (u32)(ICON_WIDTH * 0.06f));
+	u32 selectedInset = max(6, (u32)(ICON_WIDTH * 0.08f));
+	u32 selectedRound = max(16, (u32)(ICON_WIDTH * 0.28f));
 
-	// Create brushes and pens fresh each time to avoid release mode optimization issues
-	HBRUSH windowBackground    = CreateSolidBrush(BACKGROUND);
-	HBRUSH selectionBackground = CreateSolidBrush(HIGHLIGHT_BG);
-	// Use a pen the same color as the fill so the selection has no visible outline
-	HPEN   selectionOutline    = CreatePen(PS_SOLID, 1, HIGHLIGHT_BG);
+	// Create brushes
+	HBRUSH panelBrush          = CreateSolidBrush(PANEL_BG);
+	HBRUSH selectedBrush       = CreateSolidBrush(SELECTED_BG);
 
 	RECT rect = {0};
 	GetClientRect(Switcher, &rect);
@@ -1375,32 +1380,10 @@ static void RedrawSwitcher(void)
 	// Invalidate & draw window background with rounded corners
 	RedrawWindow(Switcher, null, null, RDW_INVALIDATE | RDW_ERASE);
 	
-	// Create rounded rectangle for window background (strongly rounded corners)
-	HRGN roundedRegion = CreateRoundRectRgn(0, 0, rect.right, rect.bottom, 60, 60);
-	FillRgn(DrawingContext, roundedRegion, windowBackground);
-	DeleteObject(roundedRegion);
-
-	// Select pen & brush for RoundRect (used to draw selection rectangle)
-	HPEN oldPen   = (HPEN)SelectObject(DrawingContext, selectionOutline);
-	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, selectionBackground);
-
-	// Select text font, color & background for DrawTextW (used to draw app name)
-	HFONT oldFont = (HFONT)SelectObject(
-		DrawingContext,
-		CreateFontW(
-			-18, 0, 0, 0,
-			FW_BOLD,          // Make app labels bold
-			false, false, false,
-			DEFAULT_CHARSET,
-			OUT_DEFAULT_PRECIS,
-			CLIP_DEFAULT_PRECIS,
-			CLEARTYPE_QUALITY,
-			VARIABLE_PITCH,
-			L"Segoe UI"
-		)
-	);
-	SetTextColor(DrawingContext, TEXT_COLOR);
-	SetBkMode(DrawingContext, TRANSPARENT);
+	// Draw rounded switcher panel without border stroke
+	HPEN oldPen = (HPEN)SelectObject(DrawingContext, GetStockObject(NULL_PEN));
+	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, panelBrush);
+	RoundRect(DrawingContext, 0, 0, rect.right, rect.bottom, 56, 56);
 
 	// This is how GDI handles memory?
 	//DeleteObject(oldPen);
@@ -1426,56 +1409,43 @@ static void RedrawSwitcher(void)
 		//bool app_is_mouseover = PtInRect(&icon_rect, (POINT){MouseX, MouseY});
 		//print(L"mouse %s\n", app_is_mouseover ? L"over" : L"not over");
 
-		if (app != SelectedApp) {
-			// Draw only icon, with transparent background
-			DrawIconEx(DrawingContext, left, top, app->icon, width, height, 0, NULL, DI_NORMAL);
-		} else {
-			// Draw selection rectangle and icon, with selection background
-			RoundRect(DrawingContext, left - SEL_VERT_OFF, top - SEL_HORZ_OFF, right + SEL_VERT_OFF, bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
-			DrawIconEx(DrawingContext, left, top, app->icon, width, height, 0, NULL, DI_NORMAL);
-
-			// Draw app name
-			u16 *title = app->name.text;
-
-			// Measure text width
-			RECT testRect = {0};
-			DrawTextW(DrawingContext, title, -1, &testRect, DT_CALCRECT | DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
-			i32 textWidth = (testRect.right - testRect.left) + 2; // Hmm, measured size seems a teensy bit too small, so +2
-
-			// DrawTextW uses a destination rect for drawing
-			RECT textRect = {0};
-			textRect.left = left;
-			textRect.right = right;
-			textRect.bottom = rect.bottom;
-
-			i32 widthDiff = textWidth - (textRect.right - textRect.left);
-			if (widthDiff > 0) {
-				// textRect is too small for text, grow the rect
-				textRect.left -= (i32)ceil(widthDiff / 2.0);
-				textRect.right += (i32)floor(widthDiff / 2.0);
-			}
-
-			textRect.bottom -= ICON_PAD; // *** this lifts the app text up a little ***
-
-			// If the app name, when centered, extends past window bounds, adjust label position to be inside window bounds
-			if (textRect.right > rect.right) {
-				textRect.left -= (textRect.right - rect.right) + ICON_PAD;
-				textRect.right = rect.right - ICON_PAD;
-			}
-			if (textRect.left < 0) {
-				textRect.right += ICON_PAD + abs(textRect.left);
-				textRect.left   = ICON_PAD + 0;
-			}
-
-			///* dbg */ FillRect(DrawingContext, &textRect, CreateSolidBrush(RGB(255, 0, 0))); // Check the size of the text box
-			DrawTextW(DrawingContext, title, -1, &textRect, DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
+		// Draw only selected app background for navigation context
+		if (app == SelectedApp) {
+			RECT selectedRect = {
+				left - (i32)selectedInset,
+				top - (i32)selectedInset,
+				right + (i32)selectedInset,
+				bottom + (i32)selectedInset
+			};
+			SelectObject(DrawingContext, selectedBrush);
+			RoundRect(
+				DrawingContext,
+				selectedRect.left,
+				selectedRect.top,
+				selectedRect.right,
+				selectedRect.bottom,
+				(int)selectedRound,
+				(int)selectedRound
+			);
+			SelectObject(DrawingContext, panelBrush);
 		}
+
+		// Draw app icon (no text)
+		DrawIconEx(
+			DrawingContext,
+			left + (i32)iconInset / 2,
+			top + (i32)iconInset / 2,
+			app->icon,
+			width - (i32)iconInset,
+			height - (i32)iconInset,
+			0, NULL, DI_NORMAL
+		);
+
 	}
 	
 	// Clean up GDI objects to prevent memory leaks
-	DeleteObject(windowBackground);
-	DeleteObject(selectionBackground);
-	DeleteObject(selectionOutline);
+	DeleteObject(panelBrush);
+	DeleteObject(selectedBrush);
 }
 
 static void ShowSwitcher(void)
