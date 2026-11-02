@@ -1,4 +1,6 @@
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define UNICODE
 #define _UNICODE
@@ -47,6 +49,7 @@
 #include "shobjidl.h" // For IShellItem, IShellItemImageFactory
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "msimg32.lib") // For AlphaBlend (pixel icons)
 #pragma comment(lib, "shlwapi.lib") // Only used by StringFileName for PathFindFileNameW?
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "pathcch.lib")
@@ -87,6 +90,23 @@ static const string UWPAppHostClass    = string(L"ApplicationFrameWindow");
 static const string UWPCoreWindowClass = string(L"Windows.UI.Core.CoreWindow");
 static const string WinUI3WindowClass  = string(L"WinUIDesktopWin32WindowClass");
 static const string UWPAppsPath        = string(L"C:\\Program Files\\WindowsApps");
+static const string ExplorerExe        = string(L"explorer");
+static const string ExplorerCabinetClass = string(L"CabinetWClass");
+static const string ExplorerExploreClass = string(L"ExploreWClass");
+
+// One corner-radius scale for the whole switcher. The values follow the
+// current Fluent/macOS surface language (8/12/16/24) instead of one-off
+// numbers, so the dock, the selection tile and the label pill stay coherent.
+#define RADIUS_SM       8
+#define RADIUS_MD       12
+#define RADIUS_LG       16
+#define RADIUS_XL       24
+#define RADIUS_PANEL    RADIUS_XL
+#define LABEL_GAP       10
+#define LABEL_PAD_H     14
+#define LABEL_PAD_V     10
+#define LABEL_FONT_SIZE 14
+#define LABEL_AREA_HEIGHT 40
 
 static bool StringsAreEqual(string *s1, string *s2)
 {
@@ -169,6 +189,37 @@ static void Log(u16 *fmt, ...)
 	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
 	va_end(args);
 	OutputDebugStringW(buffer);
+}
+
+static void NavLog(u16 *fmt, ...)
+{
+	// DIAG: navigation trace for the skipped-selection bug.
+	u16 buffer[512];
+	va_list args;
+	va_start(args, fmt);
+	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
+	va_end(args);
+	StringCchCatW(buffer, countof(buffer), L"\n");
+	u16 path[MAX_PATH];
+	GetTempPathW(countof(path), path);
+	StringCchCatW(path, countof(path), L"cmdtab_nav.txt");
+	FILE *f = _wfopen(path, L"a");
+	if (f) { fputws(buffer, f); fclose(f); }
+}
+
+static void DbgLog(u16 *fmt, ...)
+{
+	u16 buffer[1024];
+	va_list args;
+	va_start(args, fmt);
+	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
+	va_end(args);
+	StringCchCatW(buffer, countof(buffer), L"\n");
+	u16 path[MAX_PATH];
+	GetTempPathW(countof(path), path);
+	StringCchCatW(path, countof(path), L"cmdtab_dbg.txt");
+	FILE *f = _wfopen(path, L"a");
+	if (f) { fputws(buffer, f); fclose(f); }
 }
 
 static void Error(handle hwnd, u16 *fmt, ...)
@@ -398,37 +449,73 @@ static string GetUWPAppName(string *aumid)
 	return name;
 }
 
+#ifndef UWP_ICON_SIZE
+#define UWP_ICON_SIZE 256
+#endif
+static bool IconCacheLookup(u16 *key, handle *out);
+static void IconCacheStore(u16 *key, handle icon);
+static handle GetWindowIcon(handle hwnd);
+static int GetIconPixelWidth(handle icon);
+static void PresentSwitcher(void);
+
 static handle GetUWPAppIcon(string *aumid, handle hwnd)
 {
 	// Try multiple methods to get the UWP app icon
 	if (!aumid->ok || aumid->length == 0) {
 		return null;
 	}
-	
+
 	HICON icon = null;
-	
-	// Method 1: Try using IShellItemImageFactory (most reliable for UWP apps)
+	HICON cached = null;
+	if (IconCacheLookup(aumid->text, (handle *)&cached)) {
+		return cached; // Caller owns this copy
+	}
+
 	u16 shellPath[MAX_PATH * 2];
 	StringCchPrintfW(shellPath, countof(shellPath), L"shell:AppsFolder\\%s", aumid->text);
-	
+
+	// Method 1: SHDefExtractIcon handles UWP shell paths and returns a real
+	// alpha-blended HICON directly (no lossy HBITMAP->HICON conversion).
+	{
+		HICON hBig = null, hSmall = null;
+		if (SUCCEEDED(SHDefExtractIconW(shellPath, 0, 0, &hBig, &hSmall, UWP_ICON_SIZE))) {
+			if (hSmall) DestroyIcon(hSmall);
+			if (hBig) {
+				Print(L"Got UWP icon via SHDefExtractIcon\n");
+				IconCacheStore(aumid->text, hBig);
+				return hBig;
+			}
+		}
+	}
+
+	// Method 2: IShellItemImageFactory at full size with a correct
+	// HBITMAP->HICON conversion (old code reused the color bitmap as the
+	// mask, which destroyed the alpha channel).
 	IShellItem *shellItem = null;
 	if (SUCCEEDED(SHCreateItemFromParsingName(shellPath, null, &IID_IShellItem, (void**)&shellItem))) {
 		IShellItemImageFactory *imageFactory = null;
 		if (SUCCEEDED(IShellItem_QueryInterface(shellItem, &IID_IShellItemImageFactory, (void**)&imageFactory))) {
-			SIZE size = { 48, 48 }; // Request 48x48 icon
+			SIZE size = { UWP_ICON_SIZE, UWP_ICON_SIZE };
 			HBITMAP hbmp = null;
-			if (SUCCEEDED(IShellItemImageFactory_GetImage(imageFactory, size, SIIGBF_ICONONLY, &hbmp))) {
-				// Convert HBITMAP to HICON
-				ICONINFO iconInfo = {0};
-				iconInfo.fIcon = TRUE;
-				iconInfo.hbmColor = hbmp;
-				iconInfo.hbmMask = hbmp;
-				icon = CreateIconIndirect(&iconInfo);
+			if (SUCCEEDED(IShellItemImageFactory_GetImage(imageFactory, size, SIIGBF_ICONONLY, &hbmp)) && hbmp) {
+				BITMAP bm = {0};
+				GetObjectW(hbmp, sizeof bm, &bm);
+				// Monochrome mask: all-black = opaque, alpha in color bitmap wins.
+				HBITMAP hbmMask = CreateBitmap(bm.bmWidth ? bm.bmWidth : UWP_ICON_SIZE, bm.bmHeight ? bm.bmHeight : UWP_ICON_SIZE, 1, 1, null);
+				if (hbmMask) {
+					ICONINFO iconInfo = {0};
+					iconInfo.fIcon = TRUE;
+					iconInfo.hbmColor = hbmp;
+					iconInfo.hbmMask = hbmMask;
+					icon = CreateIconIndirect(&iconInfo);
+					DeleteObject(hbmMask);
+				}
 				DeleteObject(hbmp);
 				if (icon) {
 					Print(L"Got UWP icon via IShellItemImageFactory\n");
 					IShellItemImageFactory_Release(imageFactory);
 					IShellItem_Release(shellItem);
+					IconCacheStore(aumid->text, icon);
 					return icon;
 				}
 			}
@@ -436,33 +523,26 @@ static handle GetUWPAppIcon(string *aumid, handle hwnd)
 		}
 		IShellItem_Release(shellItem);
 	}
-	
-	// Method 2: Try using shell:AppsFolder with ExtractIconEx
+
+	// Method 3: Try using shell:AppsFolder with ExtractIconEx
 	HICON largeIcon = null, smallIcon = null;
 	if (ExtractIconExW(shellPath, 0, &largeIcon, &smallIcon, 1) > 0) {
 		if (smallIcon) DestroyIcon(smallIcon);
 		if (largeIcon) {
 			Print(L"Got UWP icon via ExtractIconEx\n");
+			IconCacheStore(aumid->text, largeIcon);
 			return largeIcon;
 		}
 	}
-	
-	// Method 3: Try getting icon from window property
-	icon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
-	if (!icon) {
-		icon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
-	}
-	if (!icon) {
-		icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
-	}
+
+	// Method 4: Try getting icon from window property
+	icon = GetWindowIcon(hwnd);
 	if (icon) {
-		// Copy the icon so we can safely destroy it later
-		icon = CopyIcon(icon);
 		Print(L"Got UWP icon from window messages\n");
-		return icon;
+		return icon; // Per-window: do not cache under AUMID
 	}
-	
-	// Method 4: Use SHGetFileInfo with shell path
+
+	// Method 5: Use SHGetFileInfo with shell path
 	IImageList *list = {0};
 	if (SUCCEEDED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) {
 		SHFILEINFOW info = {0};
@@ -470,16 +550,20 @@ static handle GetUWPAppIcon(string *aumid, handle hwnd)
 			IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &icon);
 			if (icon) {
 				Print(L"Got UWP icon via SHGetFileInfo\n");
+				IconCacheStore(aumid->text, icon);
 			}
 		}
 		IImageList_Release(list);
 	}
-	
+
 	return icon;
 }
 
 static bool IsAltTabWindow(handle hwnd)
 {
+	if (hwnd == GetShellWindow()) {
+		return false;
+	}
 	if (!IsWindowVisible(hwnd)) {
 		return false;
 	}
@@ -513,6 +597,15 @@ static bool IsAltTabWindow(handle hwnd)
 		return false;
 	}
 	return true;
+}
+
+static bool IsRealExplorerFolderWindow(string *filename, string *windowClass)
+{
+	if (!StringsAreEqual(filename, &ExplorerExe)) {
+		return true;
+	}
+	return StringsAreEqual(windowClass, &ExplorerCabinetClass) ||
+	       StringsAreEqual(windowClass, &ExplorerExploreClass);
 }
 
 static string GetExePath(handle hwnd)
@@ -646,6 +739,275 @@ static string GetAppName(string *filepath)
 		return name;
 }
 
+#define ICON_CACHE_SIZE 128
+
+struct iconCacheEntry {
+	u16 key[MAX_PATH * 2];
+	handle icon; // master copy owned by cache
+	bool used;
+};
+
+static struct iconCacheEntry IconCache[ICON_CACHE_SIZE];
+static size IconCacheNext; // round-robin eviction index
+
+static bool IconCacheLookup(u16 *key, handle *out)
+{
+	for (size i = 0; i < countof(IconCache); i++) {
+		if (IconCache[i].used && wcscmp(IconCache[i].key, key) == 0) {
+			handle copy = CopyIcon(IconCache[i].icon);
+			if (copy) {
+				*out = copy;
+				return true;
+			}
+			return false;
+		}
+	}
+	return false;
+}
+
+static void IconCacheStore(u16 *key, handle icon)
+{
+	if (!icon) return;
+	for (size i = 0; i < countof(IconCache); i++) {
+		if (IconCache[i].used && wcscmp(IconCache[i].key, key) == 0) {
+			DestroyIcon(IconCache[i].icon);
+			IconCache[i].icon = CopyIcon(icon);
+			return;
+		}
+	}
+	// Evict round-robin when full
+	size slot = IconCacheNext % countof(IconCache);
+	IconCacheNext++;
+	if (IconCache[slot].used) {
+		DestroyIcon(IconCache[slot].icon);
+	}
+	StringCchCopyW(IconCache[slot].key, countof(IconCache[slot].key), key);
+	IconCache[slot].icon = CopyIcon(icon);
+	IconCache[slot].used = IconCache[slot].icon != null;
+}
+
+static handle GetWindowIcon(handle hwnd)
+{
+	// Per-window icon first: covers Explorer folders, browsers, Electron, etc.
+	// where every window shares the same exe but has its own icon.
+	handle icon = (handle)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
+	if (!icon) {
+		icon = (handle)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
+	}
+	if (!icon) {
+		icon = (handle)GetClassLongPtrW(hwnd, GCLP_HICON);
+	}
+	if (!icon) {
+		icon = (handle)GetClassLongPtrW(hwnd, GCLP_HICONSM);
+	}
+	if (!icon) {
+		return null;
+	}
+	return CopyIcon(icon);
+}
+
+static int GetIconPixelWidth(handle icon)
+{
+	// Native width of an HICON's color bitmap; 0 if unknown.
+	ICONINFO info = {0};
+	BITMAP bm = {0};
+	int width = 0;
+	if (!GetIconInfo(icon, &info)) {
+		return 0;
+	}
+	if (info.hbmColor && GetObjectW(info.hbmColor, sizeof bm, &bm)) {
+		width = bm.bmWidth;
+	}
+	if (info.hbmColor) DeleteObject(info.hbmColor);
+	if (info.hbmMask) DeleteObject(info.hbmMask);
+	return width;
+}
+
+#define ICON_SOURCE_MAX 512
+
+static double CubicWeight(double t)
+{
+	// Catmull-Rom kernel (a = -0.5): smooth upscaling without the ringing
+	// that a wider Lanczos kernel can produce on app icons.
+	t = fabs(t);
+	if (t <= 1.0) return 1.5*t*t*t - 2.5*t*t + 1.0;
+	if (t < 2.0) return -0.5*t*t*t + 2.5*t*t - 4.0*t + 2.0;
+	return 0.0;
+}
+
+static u32 PackBgra(u32 b, u32 g, u32 r, u32 a)
+{
+	return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static int ClampInt(int value, int min, int max)
+{
+	return value < min ? min : value > max ? max : value;
+}
+
+static void ResampleIconPixels(u32 *dst, const u32 *src, int srcSize, int dstSize)
+{
+	// Filter premultiplied BGRA directly so transparent edges composite
+	// correctly. Shrinking uses area averaging (no aliasing when a 256px icon
+	// is drawn at ~125px); growing uses Catmull-Rom bicubic so 32px sources
+	// scale smoothly instead of turning into chunky pixels.
+	if (dstSize == srcSize) {
+		memcpy(dst, src, (size_t)srcSize * (size_t)srcSize * sizeof(u32));
+		return;
+	}
+	for (int y = 0; y < dstSize; y++) {
+		u32 *row = dst + (size_t)y * (size_t)dstSize;
+		if (dstSize < srcSize) {
+			int sy0 = (int)((i64)y * srcSize / dstSize);
+			int sy1 = (int)(((i64)y + 1) * srcSize / dstSize);
+			if (sy1 <= sy0) sy1 = sy0 + 1;
+			for (int x = 0; x < dstSize; x++) {
+				int sx0 = (int)((i64)x * srcSize / dstSize);
+				int sx1 = (int)(((i64)x + 1) * srcSize / dstSize);
+				if (sx1 <= sx0) sx1 = sx0 + 1;
+				u64 a = 0, r = 0, g = 0, b = 0;
+				u32 n = 0;
+				for (int sy = sy0; sy < sy1; sy++) {
+					const u32 *srcRow = src + (size_t)sy * (size_t)srcSize;
+					for (int sx = sx0; sx < sx1; sx++) {
+						u32 p = srcRow[sx];
+						b += p & 0xFF;
+						g += (p >> 8) & 0xFF;
+						r += (p >> 16) & 0xFF;
+						a += p >> 24;
+						n++;
+					}
+				}
+				row[x] = PackBgra((u32)((b + n / 2) / n), (u32)((g + n / 2) / n),
+				                  (u32)((r + n / 2) / n), (u32)((a + n / 2) / n));
+			}
+			continue;
+		}
+		double cy = ((double)y + 0.5) * srcSize / dstSize - 0.5;
+		int iy = (int)floor(cy);
+		double wy[4];
+		double sumY = 0;
+		for (int j = 0; j < 4; j++) {
+			wy[j] = CubicWeight(cy - (iy - 1 + j));
+			sumY += wy[j];
+		}
+		for (int x = 0; x < dstSize; x++) {
+			double cx = ((double)x + 0.5) * srcSize / dstSize - 0.5;
+			int ix = (int)floor(cx);
+			double wx[4];
+			double sumX = 0;
+			for (int i = 0; i < 4; i++) {
+				wx[i] = CubicWeight(cx - (ix - 1 + i));
+				sumX += wx[i];
+			}
+			double accB = 0, accG = 0, accR = 0, accA = 0;
+			for (int j = 0; j < 4; j++) {
+				int sy = ClampInt(iy - 1 + j, 0, srcSize - 1);
+				const u32 *srcRow = src + (size_t)sy * (size_t)srcSize;
+				for (int i = 0; i < 4; i++) {
+					int sx = ClampInt(ix - 1 + i, 0, srcSize - 1);
+					double w = wx[i] * wy[j];
+					u32 p = srcRow[sx];
+					accB += w * (p & 0xFF);
+					accG += w * ((p >> 8) & 0xFF);
+					accR += w * ((p >> 16) & 0xFF);
+					accA += w * (p >> 24);
+				}
+			}
+			double total = sumX * sumY;
+			if (total <= 0) total = 1;
+			row[x] = PackBgra(
+				(u32)ClampInt((int)(accB / total + 0.5), 0, 255),
+				(u32)ClampInt((int)(accG / total + 0.5), 0, 255),
+				(u32)ClampInt((int)(accR / total + 0.5), 0, 255),
+				(u32)ClampInt((int)(accA / total + 0.5), 0, 255));
+		}
+	}
+}
+
+static handle ScaleIconBitmapEx(handle icon, int targetSize, u32 **outBits)
+{
+	// Render the icon once at its best native resolution, then resample to
+	// exactly the size it will be drawn at. Every icon therefore goes through
+	// the same high-quality path: small sources are smoothly interpolated,
+	// big sources are area-averaged instead of point-sampled.
+	if (!icon || targetSize <= 0) {
+		return null;
+	}
+	if (targetSize > ICON_SOURCE_MAX) targetSize = ICON_SOURCE_MAX;
+	int srcSize = GetIconPixelWidth(icon);
+	if (srcSize <= 0) srcSize = 256; // Let DrawIconEx pick the best frame.
+	if (srcSize > ICON_SOURCE_MAX) srcSize = ICON_SOURCE_MAX;
+
+	handle screen = GetDC(null);
+	BITMAPINFO bmi = {0};
+	bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+	bmi.bmiHeader.biWidth = srcSize;
+	bmi.bmiHeader.biHeight = -srcSize; // Top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	void *bitsSrc = null;
+	HBITMAP hbmpSrc = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bitsSrc, null, 0);
+	bmi.bmiHeader.biWidth = targetSize;
+	bmi.bmiHeader.biHeight = -targetSize;
+	void *bitsDst = null;
+	HBITMAP hbmpDst = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bitsDst, null, 0);
+	handle dc = CreateCompatibleDC(screen);
+	ReleaseDC(null, screen);
+	if (!hbmpSrc || !hbmpDst || !bitsSrc || !bitsDst || !dc) {
+		if (hbmpSrc) DeleteObject(hbmpSrc);
+		if (hbmpDst) DeleteObject(hbmpDst);
+		if (dc) DeleteDC(dc);
+		return null;
+	}
+	memset(bitsSrc, 0, (size_t)srcSize * (size_t)srcSize * sizeof(u32));
+	handle oldBitmap = SelectObject(dc, hbmpSrc);
+	DrawIconEx(dc, 0, 0, icon, srcSize, srcSize, 0, null, DI_NORMAL);
+	GdiFlush();
+	ResampleIconPixels((u32 *)bitsDst, (u32 *)bitsSrc, srcSize, targetSize);
+	SelectObject(dc, oldBitmap);
+	DeleteDC(dc);
+	DeleteObject(hbmpSrc);
+	if (outBits) *outBits = (u32 *)bitsDst;
+	return hbmpDst; // Caller deletes with DeleteObject
+}
+
+static handle ScaleIconBitmap(handle icon, int targetSize)
+{
+	return ScaleIconBitmapEx(icon, targetSize, null);
+}
+
+static bool IconsLookAlike(handle a, handle b)
+{
+	// Two windows of the same app can expose the same artwork at different
+	// resolutions (a 32px WM_GETICON icon vs. a 256px exe icon). Compare tiny
+	// renders so we only swap in the sharper source when it is actually the
+	// same icon; per-window icons (Explorer folders, game launchers) keep
+	// their identity.
+	if (!a || !b) return false;
+	u32 *pa = null, *pb = null;
+	handle ha = ScaleIconBitmapEx(a, 16, &pa);
+	handle hb = ScaleIconBitmapEx(b, 16, &pb);
+	bool same = false;
+	if (ha && hb && pa && pb) {
+		u64 diff = 0;
+		u64 total = 0;
+		for (int i = 0; i < 16 * 16; i++) {
+			u32 p = pa[i], q = pb[i];
+			diff += (u64)abs((int)(p >> 24) - (int)(q >> 24));
+			diff += (u64)abs((int)(p & 0xFF) - (int)(q & 0xFF));
+			diff += (u64)abs((int)((p >> 8) & 0xFF) - (int)((q >> 8) & 0xFF));
+			diff += (u64)abs((int)((p >> 16) & 0xFF) - (int)((q >> 16) & 0xFF));
+			total += 4 * 255;
+		}
+		same = diff * 100 <= total * 15; // Mean channel difference <= 15%.
+	}
+	if (ha) DeleteObject(ha);
+	if (hb) DeleteObject(hb);
+	return same;
+}
+
 static handle GetAppIcon(string *filepath)
 {
 	//IsImmersiveProcess();
@@ -673,6 +1035,22 @@ static handle GetAppIcon(string *filepath)
 	//if (FAILED(CoInitialize(null))) {
 	//	return null;
 	//}
+	HICON cached = {0};
+	if (IconCacheLookup(filepath->text, (handle *)&cached)) {
+		return cached; // Caller owns this copy
+	}
+	// Prefer a full-resolution extraction: picks the best embedded image
+	// and scales cleanly to the requested size.
+	{
+		HICON hBig = null, hSmall = null;
+		if (SUCCEEDED(SHDefExtractIconW(filepath->text, 0, 0, &hBig, &hSmall, UWP_ICON_SIZE))) {
+			if (hSmall) DestroyIcon(hSmall);
+			if (hBig) {
+				IconCacheStore(filepath->text, hBig);
+				return hBig;
+			}
+		}
+	}
 	IImageList *list = {0};
 	if (FAILED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) {
 		return null;
@@ -685,7 +1063,36 @@ static handle GetAppIcon(string *filepath)
 	HICON icon = {0};
 	IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &icon);
 	IImageList_Release(list);
+	if (icon) {
+		IconCacheStore(filepath->text, icon);
+	}
 	return icon; // Caller is responsible for calling DestroyIcon
+}
+
+static handle ChooseWindowIcon(handle hwnd, string *filepath, bool isExplorerFolder)
+{
+	// Prefer the sharpest icon that still identifies the window. Window-owned
+	// icons win when they are already high-res; otherwise check the executable
+	// for a larger copy of the same artwork. Explorer folder windows keep their
+	// per-folder icon even at 32px, since the exe icon is a different image.
+	handle windowIcon = GetWindowIcon(hwnd);
+	int windowSize = windowIcon ? GetIconPixelWidth(windowIcon) : 0;
+	if (windowIcon && windowSize >= 64) {
+		return windowIcon;
+	}
+
+	handle appIcon = GetAppIcon(filepath);
+	int appSize = appIcon ? GetIconPixelWidth(appIcon) : 0;
+	if (appIcon && appSize > windowSize) {
+		bool keepWindowIcon = isExplorerFolder ||
+			(windowIcon && !IconsLookAlike(windowIcon, appIcon));
+		if (!keepWindowIcon) {
+			if (windowIcon) DestroyIcon(windowIcon);
+			return appIcon;
+		}
+	}
+	if (appIcon) DestroyIcon(appIcon);
+	return windowIcon;
 }
 
 static bool IsDarkModeEnabled(void)
@@ -781,9 +1188,8 @@ static void ShowWindowX(handle hwnd) // ShowWindow already taken
 			Print(L"switch to ");
 			PrintWindowX(hwnd);
 		} else {
+			Print(L"couldn't switch to ");
 			PrintWindowX(hwnd);
-			Error(null/*Switcher*/, L"ERROR couldn't switch to %s", GetWindowTitle(hwnd));
-			//CancelSwitcher(false);
 		}
 	} else {
 		Print(L"switch to: already foreground\n");
@@ -866,6 +1272,8 @@ struct app {
 	string path;                // Full path of app executable.
 	string name;                // Window title, or app name as fallback.
 	handle icon;                // Big app icon.
+	handle iconBmp;             // High-quality scaled copy of 'icon' (null = draw icon directly).
+	u32 iconBmpSize;            // Edge length of 'iconBmp' in pixels.
 	handle window;              // The specific window handle for this entry.
 	string windowTitle;         // Full window title for display.
 };
@@ -880,7 +1288,11 @@ static size HistoryCount;       // Number of elements in 'History' array.
 static handle Switcher;         // Handle for main window (i.e. switcher).
 static handle DrawingContext;   // Drawing context for double-buffered drawing of main window.
 static handle DrawingBitmap;    // Off-screen bitmap used for double-buffered drawing of main window.
+static void *DrawingBits;       // Pixel buffer of DrawingBitmap (32-bit DIB section).
 static RECT DrawingRect;        // Size of the off-screen bitmap.
+// Live layered glass when transparency effects are on (decided at startup);
+// otherwise the window stays opaque and RedrawSwitcher paints software blur.
+static bool UseLayeredGlass = false;
 static u16 Keyboard[16];        // 256 bits to track key repeat for low-level keyboard hook.
 static i32 MouseX, MouseY;      // Mouse position, for highlighting and clicking app icons.
 
@@ -1047,6 +1459,12 @@ static void AddToHistory(handle hwnd) {
 		PrintWindowX(hwnd);
 		return;
 	}
+	if (!IsRealExplorerFolderWindow(&filename, &class)) {
+		Print(L"(explorer shell) ");
+		Print(L"activate window %s", GetAppHost(hwnd) != hwnd ? L"(uwp) " : L"");
+		PrintWindowX(hwnd);
+		return;
+	}
 
 	// 'hwnd' is valid and should be added
 
@@ -1087,6 +1505,13 @@ static void AddToSwitcher(handle hwnd)
 		PrintWindowX(hwnd);
 		return;
 	}
+	// Explorer hosts many invisible shell windows; only real folder windows belong in the switcher
+	if (!IsRealExplorerFolderWindow(&filename, &class)) {
+		Print(L"(explorer shell) ");
+		Print(L"add window %s", GetAppHost(hwnd) != hwnd ? L"(uwp) " : L"");
+		PrintWindowX(hwnd);
+		return;
+	}
 	
 	// 5. Create individual entry for each window (no grouping)
 	if (AppsCount >= countof(Apps)) {
@@ -1096,6 +1521,9 @@ static void AddToSwitcher(handle hwnd)
 	
 	struct app *app = &Apps[AppsCount++];
 	if (app->icon) DestroyIcon(app->icon); // Cleanup previous icon if reusing slot
+	if (app->iconBmp) DeleteObject(app->iconBmp); // Same for the scaled bitmap
+	app->iconBmp = null;
+	app->iconBmpSize = 0;
 	
 	// Set basic app info
 	app->path = filepath;
@@ -1176,11 +1604,27 @@ static void AddToSwitcher(handle hwnd)
 			app->name = StringFileName(&filepath, false);
 		}
 	} else {
-		// Regular Win32 app - use existing logic
-		app->icon = GetAppIcon(&filepath);
+		// Regular Win32 app: use the sharpest available source while keeping
+		// the window's identity. A 32px WM_GETICON icon is soft at dock size,
+		// so the exe's 256px icon is used when it shows the same artwork;
+		// per-window icons (Explorer folders, launchers) are preserved.
+		bool isExplorerFolder = StringsAreEqual(&filename, &ExplorerExe) &&
+			(StringsAreEqual(&class, &ExplorerCabinetClass) ||
+			 StringsAreEqual(&class, &ExplorerExploreClass));
+		app->icon = ChooseWindowIcon(hwnd, &filepath, isExplorerFolder);
 		app->name = GetAppName(&filepath);
 	}
 	
+	// Never leave an invisible hole: ultimate fallback is the stock app icon.
+	// (IDI_APPLICATION = 32512; the IDI_* macros are excluded by NOICONS.)
+	if (!app->icon) {
+		Print(L"Using stock icon fallback\n");
+		app->icon = CopyIcon(LoadIconW(null, MAKEINTRESOURCEW(32512)));
+	}
+
+	// Icons are scaled lazily in RedrawSwitcher, once the final on-screen
+	// size is known (it depends on the monitor and the number of apps).
+
 	// Store window title for potential future use
 	app->windowTitle = GetWindowTitle(hwnd);
 	
@@ -1244,6 +1688,47 @@ static void SelectFirstWindow(void)
 	}
 }
 
+static i32 GetAppIconLeft(int index, u32 iconWidth, u32 iconPad, u32 horzPad)
+{
+	i32 left0 = index == 0 ? (i32)iconPad : 0;
+	i32 right0 = index != 0 ? (i32)iconPad : 0;
+	i32 icons = (iconPad + iconWidth + iconPad) * index;
+	return horzPad + left0 + icons + right0;
+}
+
+static handle MakeDockLabelRegion(u32 width, u32 dockHeight, RECT *labelRect, bool hasLabel)
+{
+	// Union of the dock panel and the label pill (caller owns the result).
+	int panelRound = min((int)dockHeight, RADIUS_PANEL * 2);
+	HRGN dockRegion = CreateRoundRectRgn(0, 0, (int)width, (int)dockHeight, panelRound, panelRound);
+	HRGN windowRegion = dockRegion;
+	if (hasLabel) {
+		// Chips read as pills in the current design language: fully rounded
+		// ends with the radius derived from the pill's own height.
+		int labelW = labelRect->right - labelRect->left;
+		int labelH = labelRect->bottom - labelRect->top;
+		int labelRound = max(1, min(labelW, labelH));
+		HRGN labelRegion = CreateRoundRectRgn(
+			labelRect->left,
+			labelRect->top,
+			labelRect->right + 1,
+			labelRect->bottom + 2,
+			labelRound, labelRound
+		);
+		windowRegion = CreateRectRgn(0, 0, 0, 0);
+		CombineRgn(windowRegion, dockRegion, labelRegion, RGN_OR);
+		DeleteObject(dockRegion);
+		DeleteObject(labelRegion);
+	}
+	return windowRegion;
+}
+
+static void UpdateSwitcherWindowRegion(u32 width, u32 dockHeight, RECT *labelRect, bool hasLabel)
+{
+	// SetWindowRgn takes ownership of the region, so don't delete it.
+	SetWindowRgn(Switcher, MakeDockLabelRegion(width, dockHeight, labelRect, hasLabel), TRUE);
+}
+
 static void SelectNextWindow(bool applevel, bool reverse, bool wrap)
 {
 	if (!SelectedApp) {
@@ -1271,6 +1756,7 @@ static void SelectNextWindow(bool applevel, bool reverse, bool wrap)
 	}
 	
 	SelectedWindow = SelectedApp->window;
+	NavLog(L"step sel=%d count=%d", (int)(SelectedApp - Apps), (int)AppsCount);
 	
 	Print(L"select ");
 	PrintWindowX(SelectedWindow);
@@ -1296,11 +1782,12 @@ static void ResizeSwitcher(void)
 	
 	u32 iconWidth   = maxIconWidth;
 	u32 iconPadding = 12;
-	u32 padding = basePadding;
+	u32 padding = basePadding; // vertical padding (top/bottom of icons)
+	u32 horzPad = 14;          // side padding; + iconPadding = 26, matches vertical
 
 	u32 w = 0;
 	u32 usableWidth = screenWidth > sideGutter * 2 ? screenWidth - sideGutter * 2 : screenWidth;
-	u32 marginWidth = 2 * padding;
+	u32 marginWidth = 2 * horzPad;
 	u32 requiredWidth = (AppsCount * iconWidth) + (AppsCount * iconPadding * 2) + marginWidth;
 
 	// Keep natural size whenever possible; only shrink when it doesn't fit.
@@ -1314,29 +1801,24 @@ static void ResizeSwitcher(void)
 		}
 	}
 
-	// Height with icons only (no labels)
-	u32 switcherHeight = (u32)(padding + iconWidth + padding);
-	u32 maxHeight = min((u32)300, (u32)(screenHeight * 0.90f));
-	if (switcherHeight > maxHeight) {
-		switcherHeight = maxHeight;
+	// Dock height (icons) plus space below for the app-name label pill
+	u32 dockHeight = (u32)(padding + iconWidth + padding);
+	u32 maxDockHeight = min((u32)300, (u32)(screenHeight * 0.90f));
+	if (dockHeight > maxDockHeight) {
+		dockHeight = maxDockHeight;
 	}
 
-	u32 h = switcherHeight;
+	u32 h = dockHeight + LABEL_GAP + LABEL_AREA_HEIGHT;
 	i32 x = mi.rcMonitor.left + (screenWidth - w) / 2;
 	i32 y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top - h) / 2;
 	
 	// Update Config so RedrawSwitcher uses the scaled metrics
 	Config.iconWidth          = iconWidth;
-	Config.switcherHeight     = switcherHeight;
-	Config.switcherHorzMargin = padding;
+	Config.switcherHeight     = dockHeight;
+	Config.switcherHorzMargin = horzPad;
 	Config.switcherVertMargin = padding;
 
 	MoveWindow(Switcher, x, y, w, h, false); // Yes, "MoveWindow" means "ResizeWindow"
-	
-	// Apply more rounded corners to the window itself
-	HRGN windowRegion = CreateRoundRectRgn(0, 0, w, h, 56, 56);
-	SetWindowRgn(Switcher, windowRegion, TRUE);
-	// Note: SetWindowRgn takes ownership of the region, so don't delete it
 
 	// Resize off-screen double-buffering bitmap
 	RECT resized = {x, y, x+w, y+h};
@@ -1346,70 +1828,245 @@ static void ResizeSwitcher(void)
 		DeleteDC(DrawingContext);
 		DrawingRect = resized;
 		DrawingContext = CreateCompatibleDC(context);
-		DrawingBitmap = CreateCompatibleBitmap(context, DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top);
-		handle oldBitmap = (handle)SelectObject(DrawingContext, DrawingBitmap);
-		DeleteObject(oldBitmap);
+		{
+			// 32-bit top-down DIB: CPU-writable (translucent fill) and
+			// alpha-correct for UpdateLayeredWindow.
+			i32 bw = DrawingRect.right - DrawingRect.left;
+			i32 bh = DrawingRect.bottom - DrawingRect.top;
+			BITMAPINFO dbmi = {0};
+			dbmi.bmiHeader.biSize = sizeof(dbmi.bmiHeader);
+			dbmi.bmiHeader.biWidth = bw;
+			dbmi.bmiHeader.biHeight = -bh;
+			dbmi.bmiHeader.biPlanes = 1;
+			dbmi.bmiHeader.biBitCount = 32;
+			dbmi.bmiHeader.biCompression = BI_RGB;
+			DrawingBitmap = CreateDIBSection(context, &dbmi, DIB_RGB_COLORS, &DrawingBits, null, 0);
+		}
+		DbgLog(L"dib bmp=%p bits=%p %dx%d gle=%u", DrawingBitmap, DrawingBits, (int)(DrawingRect.right - DrawingRect.left), (int)(DrawingRect.bottom - DrawingRect.top), GetLastError());
+		if (DrawingBitmap) {
+			handle oldBitmap = (handle)SelectObject(DrawingContext, DrawingBitmap);
+			DeleteObject(oldBitmap);
+		}
 		ReleaseDC(Switcher, context);
 	}
+}
+
+static handle BackdropSmall = null; // Downscaled blurred snapshot of what's behind the switcher (32-bit DIB section)
+static void *BackdropBits = null; // Pixel buffer of BackdropSmall
+static i32 BackdropSmallW, BackdropSmallH;
+static i32 BackdropW, BackdropH;
+static bool BackdropValid = false;
+
+static void FreeBackdrop(void)
+{
+	if (BackdropSmall) { DeleteObject(BackdropSmall); BackdropSmall = null; BackdropBits = null; }
+	BackdropSmallW = BackdropSmallH = 0;
+	BackdropW = BackdropH = 0;
+	BackdropValid = false;
+}
+
+static void CaptureBackdrop(void)
+{
+	// Snapshot the screen behind the switcher (it is still hidden at this
+	// point) and shrink it to 1/8: downscaling IS the blur (frosted glass).
+	// Works whether or not Windows transparency effects are enabled.
+	i32 w = (i32)(DrawingRect.right - DrawingRect.left);
+	i32 h = (i32)(DrawingRect.bottom - DrawingRect.top);
+	if (w <= 0 || h <= 0) return;
+	i32 sw = max(1, w / 8);
+	i32 sh = max(1, h / 8);
+	handle screen0 = GetDC(null);
+	if (!BackdropSmall) {
+		BITMAPINFO bmi = {0};
+		bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+		bmi.bmiHeader.biWidth = sw;
+		bmi.bmiHeader.biHeight = -sh; // Top-down
+		bmi.bmiHeader.biPlanes = 1;
+		bmi.bmiHeader.biBitCount = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+		BackdropSmall = CreateDIBSection(screen0, &bmi, DIB_RGB_COLORS, &BackdropBits, null, 0);
+		if (!BackdropSmall || !BackdropBits) { BackdropSmall = null; BackdropBits = null; ReleaseDC(null, screen0); return; }
+		BackdropSmallW = sw;
+		BackdropSmallH = sh;
+	}
+	ReleaseDC(null, screen0);
+	handle screen = GetDC(null);
+	handle tmpContext = CreateCompatibleDC(screen);
+	handle fullBmp = CreateCompatibleBitmap(screen, w, h);
+	handle oldTmp = (handle)SelectObject(tmpContext, fullBmp);
+	BitBlt(tmpContext, 0, 0, w, h, screen, DrawingRect.left, DrawingRect.top, SRCCOPY);
+	handle smallContext = CreateCompatibleDC(screen);
+	handle oldSmall = (handle)SelectObject(smallContext, BackdropSmall);
+	SetStretchBltMode(smallContext, HALFTONE);
+	SetBrushOrgEx(smallContext, 0, 0, null);
+	StretchBlt(smallContext, 0, 0, sw, sh, tmpContext, 0, 0, w, h, SRCCOPY);
+	// Second pass for extra softness: up and down again.
+	SetStretchBltMode(tmpContext, HALFTONE);
+	SetBrushOrgEx(tmpContext, 0, 0, null);
+	StretchBlt(tmpContext, 0, 0, w, h, smallContext, 0, 0, sw, sh, SRCCOPY);
+	StretchBlt(smallContext, 0, 0, sw, sh, tmpContext, 0, 0, w, h, SRCCOPY);
+	// Darken to dark-glass level with a deterministic software multiply
+	// (no dependence on AlphaBlend/DWM state).
+	GdiFlush();
+	if (BackdropBits) {
+		u32 *pixels = (u32 *)BackdropBits;
+		i32 count = sw * sh;
+		for (i32 i = 0; i < count; i++) {
+			u32 p = pixels[i];
+			u32 b = (p & 0xFF) * 77 / 256;
+			u32 g = ((p >> 8) & 0xFF) * 77 / 256;
+			u32 r = ((p >> 16) & 0xFF) * 77 / 256;
+			pixels[i] = (p & 0xFF000000) | (r << 16) | (g << 8) | b;
+		}
+	}
+	SelectObject(smallContext, oldSmall);
+	SelectObject(tmpContext, oldTmp);
+	DeleteDC(smallContext);
+	DeleteDC(tmpContext);
+	DeleteObject(fullBmp);
+	ReleaseDC(null, screen);
+	BackdropW = w;
+	BackdropH = h;
+	BackdropValid = true;
+}
+
+static void PaintBackdropGlass(void)
+{
+	// Frosted glass: stretch the blurred snapshot over the buffer, then
+	// darken it with a translucent black layer for the dark-glass look.
+	i32 w = (i32)(DrawingRect.right - DrawingRect.left);
+	i32 h = (i32)(DrawingRect.bottom - DrawingRect.top);
+	if (w <= 0 || h <= 0) return;
+	if (!BackdropValid || !BackdropSmall || w != BackdropW || h != BackdropH) {
+		FreeBackdrop();
+		CaptureBackdrop();
+	}
+	if (!BackdropValid || !BackdropSmall) {
+		HBRUSH fallback = CreateSolidBrush(RGB(0, 0, 0));
+		RECT full = { 0, 0, w, h };
+		FillRect(DrawingContext, &full, fallback);
+		DeleteObject(fallback);
+		return;
+	}
+	handle screen = GetDC(null);
+	handle smallContext = CreateCompatibleDC(screen);
+	handle oldSmall = (handle)SelectObject(smallContext, BackdropSmall);
+	SetStretchBltMode(DrawingContext, HALFTONE);
+	SetBrushOrgEx(DrawingContext, 0, 0, null);
+	StretchBlt(DrawingContext, 0, 0, w, h, smallContext, 0, 0, BackdropSmallW, BackdropSmallH, SRCCOPY);
+	SelectObject(smallContext, oldSmall);
+	DeleteDC(smallContext);
+	ReleaseDC(null, screen);
+}
+
+static void FillTranslucentBlack(u32 alpha)
+{
+	// CPU fill of the 32-bit backbuffer: opaque black would kill the glass,
+	// so every pixel gets RGB=0 with the given alpha.
+	i32 w = DrawingRect.right - DrawingRect.left;
+	i32 h = DrawingRect.bottom - DrawingRect.top;
+	if (!DrawingBits || w <= 0 || h <= 0) return;
+	u32 *pixels = (u32 *)DrawingBits;
+	u32 v = (alpha << 24);
+	i32 count = w * h;
+	for (int i = 0; i < count; i++) {
+		pixels[i] = v;
+	}
+	GdiFlush();
+}
+
+static void FillRoundedHighlight(RECT rect, u32 cornerRadius, u32 color, u32 alpha)
+{
+	// Source-over fill of a rounded rect in the 32-bit backbuffer. GDI fills
+	// leave alpha at zero, which would punch a transparent hole in a layered
+	// window — so the highlight is composited on the CPU instead, and the
+	// corner radius matches the rest of the switcher's radius scale.
+	i32 w = DrawingRect.right - DrawingRect.left;
+	if (!DrawingBits || w <= 0 || alpha == 0) return;
+	i32 left = max(rect.left, 0);
+	i32 top = max(rect.top, 0);
+	i32 right = min(rect.right, w);
+	i32 bottom = min(rect.bottom, DrawingRect.bottom - DrawingRect.top);
+	i32 r = (i32)cornerRadius;
+	if (r < 0) r = 0;
+	u32 sr = ((color >> 16) & 0xFF) * alpha / 255;
+	u32 sg = ((color >> 8) & 0xFF) * alpha / 255;
+	u32 sb = (color & 0xFF) * alpha / 255;
+	u32 inv = 255 - alpha;
+	u32 *pixels = (u32 *)DrawingBits;
+	for (i32 y = top; y < bottom; y++) {
+		for (i32 x = left; x < right; x++) {
+			if (r > 0) {
+				i32 dx = 0, dy = 0;
+				if (x < left + r) dx = left + r - x;
+				else if (x >= right - r) dx = x - (right - r - 1);
+				if (y < top + r) dy = top + r - y;
+				else if (y >= bottom - r) dy = y - (bottom - r - 1);
+				if (dx * dx + dy * dy > r * r) continue;
+			}
+			u32 *p = pixels + (size_t)y * (size_t)w + x;
+			u32 d = *p;
+			u32 b = sb + (d & 0xFF) * inv / 255;
+			u32 g = sg + ((d >> 8) & 0xFF) * inv / 255;
+			u32 rr = sr + ((d >> 16) & 0xFF) * inv / 255;
+			u32 a = alpha + (d >> 24) * inv / 255;
+			*p = (a << 24) | (rr << 16) | (g << 8) | b;
+		}
+	}
+	GdiFlush();
 }
 
 static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
-	// Visual style: single rounded panel with icon-only items.
-	#define PANEL_BG       RGB(35, 42, 56)
-	#define SELECTED_BG    RGB(24, 30, 42)
+	#define PANEL_BG       RGB(0, 0, 0)
+	#define SELECTED_BG    RGB(150, 150, 150)
+	#define LABEL_BG       RGB(0, 0, 0)
+	#define LABEL_TEXT     RGB(255, 255, 255)
 
-	// Use Config values instead of hardcoded constants
 	u32 ICON_WIDTH = Config.iconWidth;
 	u32 ICON_PAD   = Config.iconHorzPadding;
 	u32 HORZ_PAD   = Config.switcherHorzMargin;
 	u32 VERT_PAD   = Config.switcherVertMargin;
+	u32 DOCK_HEIGHT = Config.switcherHeight;
 
 	u32 iconInset = max(4, (u32)(ICON_WIDTH * 0.06f));
 	u32 selectedInset = max(6, (u32)(ICON_WIDTH * 0.08f));
-	u32 selectedRound = max(16, (u32)(ICON_WIDTH * 0.28f));
-
-	// Create brushes
-	HBRUSH panelBrush          = CreateSolidBrush(PANEL_BG);
-	HBRUSH selectedBrush       = CreateSolidBrush(SELECTED_BG);
+	// Selection tile: ~20% of its edge, clamped to the shared radius scale.
+	u32 selectedRadius = (u32)ClampInt((int)(ICON_WIDTH * 0.20f), RADIUS_MD, RADIUS_XL);
 
 	RECT rect = {0};
 	GetClientRect(Switcher, &rect);
 
-	// Invalidate & draw window background with rounded corners
 	RedrawWindow(Switcher, null, null, RDW_INVALIDATE | RDW_ERASE);
-	
-	// Draw rounded switcher panel without border stroke
-	HPEN oldPen = (HPEN)SelectObject(DrawingContext, GetStockObject(NULL_PEN));
-	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, panelBrush);
-	RoundRect(DrawingContext, 0, 0, rect.right, rect.bottom, 56, 56);
 
-	// This is how GDI handles memory?
-	//DeleteObject(oldPen);
-	//DeleteObject(oldBrush);
-	//DeleteObject(oldFont);
+	// Background: translucent tint over live DWM blur, or painted software
+	// glass when transparency effects are off.
+	// The window region clips it to the dock + label shapes.
+	DbgLog(L"bg glass=%d apps=%d", (int)UseLayeredGlass, (int)AppsCount);
+	if (UseLayeredGlass) {
+		FillTranslucentBlack(200);
+	} else {
+		PaintBackdropGlass();
+	}
 
+	SelectObject(DrawingContext, GetStockObject(NULL_PEN));
+
+	// Center the icon row: with an exact-fit width this is a no-op, but it
+	// guarantees equal side margins whenever width and row disagree.
+	i32 rowWidth = (i32)AppsCount * ((i32)ICON_WIDTH + (i32)ICON_PAD * 2);
+	i32 rowOffset = ((i32)rect.right - (i32)HORZ_PAD * 2 - rowWidth) / 2;
+	if (rowOffset < 0) rowOffset = 0;
 	for (int i = 0; i < AppsCount; i++) {
 		struct app *app = &Apps[i];
 
-		// Special-case math for index 0
-		i32  left0 = i == 0 ? ICON_PAD : 0;
-		i32 right0 = i != 0 ? ICON_PAD : 0;
-
-		i32  icons = (ICON_PAD + ICON_WIDTH + ICON_PAD) * i;
-		i32   left = HORZ_PAD + left0 + icons + right0;
+		i32   left = GetAppIconLeft(i, ICON_WIDTH, ICON_PAD, HORZ_PAD) + rowOffset;
 		i32    top = VERT_PAD;
 		i32  width = ICON_WIDTH;
 		i32 height = ICON_WIDTH;
 		i32  right = left + width;
 		i32 bottom = top + height;
 
-		//RECT icon_rect = (RECT){left, top, right, bottom};
-		//bool app_is_mouseover = PtInRect(&icon_rect, (POINT){MouseX, MouseY});
-		//print(L"mouse %s\n", app_is_mouseover ? L"over" : L"not over");
-
-		// Draw only selected app background for navigation context
 		if (app == SelectedApp) {
 			RECT selectedRect = {
 				left - (i32)selectedInset,
@@ -1417,40 +2074,106 @@ static void RedrawSwitcher(void)
 				right + (i32)selectedInset,
 				bottom + (i32)selectedInset
 			};
-			SelectObject(DrawingContext, selectedBrush);
-			RoundRect(
-				DrawingContext,
-				selectedRect.left,
-				selectedRect.top,
-				selectedRect.right,
-				selectedRect.bottom,
-				(int)selectedRound,
-				(int)selectedRound
-			);
-			SelectObject(DrawingContext, panelBrush);
+			FillRoundedHighlight(selectedRect, selectedRadius, SELECTED_BG, 90);
 		}
 
-		// Draw app icon (no text)
-		DrawIconEx(
+		i32 drawLeft = left + (i32)iconInset / 2;
+		i32 drawTop = top + (i32)iconInset / 2;
+		i32 drawSize = width - (i32)iconInset;
+		// Build the scaled bitmap once per icon/size. The target size depends
+		// on the monitor and app count, so it cannot be known in AddToSwitcher.
+		if (app->icon && (app->iconBmpSize != (u32)drawSize || !app->iconBmp)) {
+			if (app->iconBmp) DeleteObject(app->iconBmp);
+			app->iconBmp = ScaleIconBitmap(app->icon, drawSize);
+			app->iconBmpSize = app->iconBmp ? (u32)drawSize : 0;
+		}
+		if (app->iconBmp) {
+			// High-quality pre-scaled bitmap with per-pixel alpha.
+			handle srcContext = CreateCompatibleDC(DrawingContext);
+			handle oldSrc = (handle)SelectObject(srcContext, app->iconBmp);
+			BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+			AlphaBlend(DrawingContext, drawLeft, drawTop, drawSize, drawSize, srcContext, 0, 0, (int)app->iconBmpSize, (int)app->iconBmpSize, bf);
+			SelectObject(srcContext, oldSrc);
+			DeleteDC(srcContext);
+		} else {
+			DrawIconEx(
+				DrawingContext,
+				drawLeft,
+				drawTop,
+				app->icon,
+				drawSize,
+				drawSize,
+				0, NULL, DI_NORMAL
+			);
+		}
+	}
+
+	RECT labelRect = {0};
+	bool hasLabel = false;
+
+	if (SelectedApp && SelectedApp->name.ok && SelectedApp->name.length > 0) {
+		HFONT labelFont = CreateFontW(
+			-LABEL_FONT_SIZE, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+			ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
+		);
+		HFONT oldFont = (HFONT)SelectObject(DrawingContext, labelFont);
+		SetBkMode(DrawingContext, TRANSPARENT);
+		SetTextColor(DrawingContext, LABEL_TEXT);
+
+		TEXTMETRICW textMetrics = {0};
+		GetTextMetricsW(DrawingContext, &textMetrics);
+
+		SIZE textSize = {0};
+		GetTextExtentPoint32W(DrawingContext, SelectedApp->name.text, (int)SelectedApp->name.length, &textSize);
+
+		i32 labelWidth  = textSize.cx + LABEL_PAD_H * 2;
+		i32 labelHeight = textMetrics.tmHeight + LABEL_PAD_V * 2;
+		i32 labelLeft   = rect.right / 2 - labelWidth / 2;
+		i32 labelTop    = (i32)DOCK_HEIGHT + LABEL_GAP;
+
+		labelRect = (RECT){ labelLeft, labelTop, labelLeft + labelWidth, labelTop + labelHeight };
+		hasLabel = true;
+
+		// No pill fill: the label text floats directly on the glass.
+		RECT textRect = {
+			labelRect.left + LABEL_PAD_H,
+			labelRect.top + LABEL_PAD_V,
+			labelRect.right - LABEL_PAD_H,
+			labelRect.bottom - LABEL_PAD_V
+		};
+		DrawTextW(
 			DrawingContext,
-			left + (i32)iconInset / 2,
-			top + (i32)iconInset / 2,
-			app->icon,
-			width - (i32)iconInset,
-			height - (i32)iconInset,
-			0, NULL, DI_NORMAL
+			SelectedApp->name.text,
+			(int)SelectedApp->name.length,
+			&textRect,
+			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
 		);
 
+		SelectObject(DrawingContext, oldFont);
+		DeleteObject(labelFont);
 	}
-	
-	// Clean up GDI objects to prevent memory leaks
-	DeleteObject(panelBrush);
-	DeleteObject(selectedBrush);
+
+	UpdateSwitcherWindowRegion((u32)rect.right, DOCK_HEIGHT, &labelRect, hasLabel);
+
+	if (UseLayeredGlass) {
+		// Live blur behind the dock + label shapes (DWM copies the region).
+		HRGN blurRegion = MakeDockLabelRegion((u32)rect.right, DOCK_HEIGHT, &labelRect, hasLabel);
+		if (blurRegion) {
+			DWM_BLURBEHIND bb = {0};
+			bb.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
+			bb.fEnable = TRUE;
+			bb.hRgnBlur = blurRegion;
+			DwmEnableBlurBehindWindow(Switcher, &bb);
+			DeleteObject(blurRegion);
+		}
+	}
 }
 
 static void ShowSwitcher(void)
 {
 	//ReceiveLastInputEvent();
+	PresentSwitcher(); // No stale first frame: present before showing
 	ShowWindow(Switcher, SW_SHOWNA);
 	if (SetForegroundWindow(Switcher)) {
 		LockSetForegroundWindow(LSFW_LOCK);
@@ -1462,6 +2185,7 @@ static void CancelSwitcher(bool restore)
 	Print(L"cancel/close\n");
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
+	FreeBackdrop();
 	if (restore) {
 		// TODO Check that the restore window is not the second most recently
 		//      activated window (after my own switcher window), so that I
@@ -1559,6 +2283,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				SelectNextWindow(true, shiftHeld, !Config.wrapbump || !keyRepeat);
 			}
 			SelectNextWindow(true, shiftHeld, !Config.wrapbump || !keyRepeat); // Siempre seleccionar la siguiente app
+			NavLog(L"activate count=%d sel=%d", (int)AppsCount, SelectedApp ? (int)(SelectedApp - Apps) : -1);
 			if (Config.showSwitcherForApps) {
 				ResizeSwitcher(); // NOTE Must call ResizeSwitcher after UpdateApps, before RedrawSwitcher & before ShowSwitcher
 				RedrawSwitcher();
@@ -1592,7 +2317,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Since I "own" this hotkey system-wide, I consume this message unconditionally
 			// This will consume the key2Down event. Windows will not know that key2 was pressed
 			goto consumeMessage;
-		}
+			}
 
 	} else { // if (SelectedWindow) {
 
@@ -1794,6 +2519,27 @@ static void OnWindowCreate(void)
 	UpdateApps();
 }
 
+static void PresentSwitcher(void)
+{
+	// Push the backbuffer to screen. Called from OnWindowPaint AND
+	// synchronously before ShowSwitcher, so the first visible frame can
+	// never be a stale one from the previous session.
+	if (UseLayeredGlass) {
+		POINT pos = { DrawingRect.left, DrawingRect.top };
+		SIZE size = { DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top };
+		POINT src = { 0, 0 };
+		BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+		GdiFlush();
+		UpdateLayeredWindow(Switcher, null, &pos, &size, DrawingContext, &src, 0, &bf, ULW_ALPHA);
+	} else {
+		handle context = GetDC(Switcher);
+		if (context) {
+			BitBlt(context, 0, 0, DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top, DrawingContext, 0, 0, SRCCOPY);
+			ReleaseDC(Switcher, context);
+		}
+	}
+}
+
 static void OnWindowPaint(void)
 {
 	// Double buffered drawing:
@@ -1802,15 +2548,9 @@ static void OnWindowPaint(void)
 	// off-screen buffer to screen ("screen" means the 'hdc' returned by
 	// BeginPaint passed our 'hwnd')
 	PAINTSTRUCT ps = {0};
-	handle context = BeginPaint(Switcher, &ps);
-	if (ps.fErase) {
-	}
-	BitBlt(context, 0, 0, DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top, DrawingContext, 0, 0, SRCCOPY);
-	//int scale = 1.0;
-	//SetStretchBltMode(DrawingContext, HALFTONE);
-	//StretchBlt(hdc, 0, 0, gdi_width, gdi_height, DrawingContext, 0, 0, gdi_width * scale, gdi_height * scale, SRCCOPY);
+	BeginPaint(Switcher, &ps);
+	PresentSwitcher();
 	EndPaint(Switcher, &ps);
-	ReleaseDC(Switcher, context);
 }
 
 static void OnWindowFocusChange(bool focused)
@@ -1971,6 +2711,16 @@ static int RunCmdTab(handle instance, u16 *args)
 
 	// Initialize runtime-dependent settings, for example dependent on user's current kbd layout
 	InitConfig();
+	// Layered live glass needs Windows transparency effects; otherwise the
+	// window stays opaque and RedrawSwitcher paints the software blur.
+	// (Decided here because the window style depends on it below.)
+	{
+		ULONG glass = 0;
+		ULONG glassSize = sizeof glass;
+		if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"EnableTransparency", RRF_RT_DWORD, null, &glass, &glassSize) && glass) {
+			UseLayeredGlass = true;
+		}
+	}
 	
 	// Hide taskbar if enabled
 	HideTaskbar();
@@ -1984,7 +2734,11 @@ static int RunCmdTab(handle instance, u16 *args)
 	wcex.lpszClassName = L"cmdtabSwitcher";
 	// Toolwindow + topmost; no WS_EX_LAYERED so the surface itself is fully opaque,
 	// and only the DWM blur effect provides the \"glass\" feel.
-	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+	DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+	if (UseLayeredGlass) {
+		exStyle |= WS_EX_LAYERED; // Per-pixel alpha for live DWM glass
+	}
+	Switcher = CreateWindowExW(exStyle,
 	                           MAKEINTATOM(RegisterClassExW(&wcex)),
 	                           null, 0, 0, 0, 0, 0, null, null, instance, null);
 	// Clear all window styles for very plain window
@@ -1993,14 +2747,15 @@ static int RunCmdTab(handle instance, u16 *args)
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
 
-	// Explicitly disable blur-behind to avoid any DWM-driven translucency.
-	// This keeps the dock background fully opaque; if we ever want blur again,
-	// we'll need to reintroduce it knowing it always implies some transparency.
-	DWM_BLURBEHIND bb = {0};
-	bb.dwFlags = DWM_BB_ENABLE;
-	bb.fEnable = FALSE;
-	bb.hRgnBlur = NULL;
-	DwmEnableBlurBehindWindow(Switcher, &bb);
+	// With layered live glass the blur is applied per-shape in RedrawSwitcher;
+	// without it the window stays fully opaque and DWM must not blend it.
+	if (!UseLayeredGlass) {
+		DWM_BLURBEHIND bb = {0};
+		bb.dwFlags = DWM_BB_ENABLE;
+		bb.fEnable = FALSE;
+		bb.hRgnBlur = NULL;
+		DwmEnableBlurBehindWindow(Switcher, &bb);
+	}
 
 	// Install keyboard hook and event hooks for foreground window changes. Raymond Chen: https://devblogs.microsoft.com/oldnewthing/20130930-00/?p=3083
 	keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, (HOOKPROC)KeyboardHookProcedure, null, 0);
