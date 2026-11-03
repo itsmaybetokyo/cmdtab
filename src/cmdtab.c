@@ -94,14 +94,10 @@ static const string ExplorerExe        = string(L"explorer");
 static const string ExplorerCabinetClass = string(L"CabinetWClass");
 static const string ExplorerExploreClass = string(L"ExploreWClass");
 
-// One corner-radius scale for the whole switcher. The values follow the
-// current Fluent/macOS surface language (8/12/16/24) instead of one-off
-// numbers, so the dock, the selection tile and the label pill stay coherent.
-#define RADIUS_SM       8
-#define RADIUS_MD       12
-#define RADIUS_LG       16
-#define RADIUS_XL       24
-#define RADIUS_PANEL    RADIUS_XL
+// Flock's app icon uses a 48px corner radius on a 256px canvas: 18.75% of
+// its edge. The switcher reuses that same ratio so the dock, the selection
+// tile and the label chip read as one shape family.
+#define RADIUS_RATIO 0.1875f
 #define LABEL_GAP       10
 #define LABEL_PAD_H     14
 #define LABEL_PAD_V     10
@@ -1698,13 +1694,14 @@ static i32 GetAppIconLeft(int index, u32 iconWidth, u32 iconPad, u32 horzPad)
 
 static handle MakeDockLabelRegion(u32 width, u32 dockHeight, RECT *labelRect, bool hasLabel)
 {
-	// Union of the dock panel and the label pill (caller owns the result).
-	int panelRound = min((int)dockHeight, RADIUS_PANEL * 2);
+	// Union of the dock panel and the label chip (caller owns the result).
+	// CreateRoundRectRgn takes the corner ellipse size, so radius × 2.
+	int panelRound = max(2, (int)(dockHeight * RADIUS_RATIO * 2.0f));
 	HRGN dockRegion = CreateRoundRectRgn(0, 0, (int)width, (int)dockHeight, panelRound, panelRound);
 	HRGN windowRegion = dockRegion;
 	if (hasLabel) {
-		// Chips read as pills in the current design language: fully rounded
-		// ends with the radius derived from the pill's own height.
+		// Text chips stay fully rounded: they are pills, not tiles, so the
+		// icon ratio would make them read as stray rounded rectangles.
 		int labelW = labelRect->right - labelRect->left;
 		int labelH = labelRect->bottom - labelRect->top;
 		int labelRound = max(1, min(labelW, labelH));
@@ -2032,8 +2029,10 @@ static void RedrawSwitcher(void)
 
 	u32 iconInset = max(4, (u32)(ICON_WIDTH * 0.06f));
 	u32 selectedInset = max(6, (u32)(ICON_WIDTH * 0.08f));
-	// Selection tile: ~20% of its edge, clamped to the shared radius scale.
-	u32 selectedRadius = (u32)ClampInt((int)(ICON_WIDTH * 0.20f), RADIUS_MD, RADIUS_XL);
+	// Concentric with the icon: the outer highlight radius equals the drawn
+	// icon's Flock-style radius plus the gap between icon and highlight.
+	u32 iconSize = ICON_WIDTH - iconInset;
+	u32 selectedRadius = (u32)(iconSize * RADIUS_RATIO + 0.5f) + selectedInset + iconInset / 2;
 
 	RECT rect = {0};
 	GetClientRect(Switcher, &rect);
